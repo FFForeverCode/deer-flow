@@ -458,6 +458,172 @@ MCP 工具名来自外部服务器，是**不可信输入**。渲染进 `<availa
 📚 **底层原理**：事件循环单线程；`copy_context` 快照 contextvar；线程池执行器。
 ⚠ **常见错误**：「run_until_complete 就行」——在运行中的 loop 上会 RuntimeError。
 
+### 问题 5：延迟工具这个设计是什么？你是如何实现的？
+
+> 这是本项目最核心的设计，值得完整、分层地讲清楚「是什么—为什么—怎么做—怎么保证正确」。
+
+⭐ **高分回答（STAR）**
+
+- **S（背景）**：我们的 Agent 运行时接入了 20+ 社区搜索/抓取 Provider，还允许用户挂载任意数量的 MCP 服务器工具。对面向 token 计费的大模型来说，每个工具的 JSON schema 都要占上下文——全部绑定可能占用**几万 token**，既贵又稀释模型注意力。这就是「工具爆炸」。
+
+- **T（目标）**：在工具数量不可控的前提下，让模型的上下文成本可控，同时不牺牲工具的可用性——需要时仍能完整拿到 schema 并正常调用；而且在还没解锁前，绝不能让模型误调用未授权的工具。
+
+- **A（我怎么做的）**：我实现了**延迟工具（Deferred Tools）+ tool_search 按需发现 + promote 状态机**这一套闭环。分四步讲：
+
+  **① 是什么**：延迟工具就是「初始只给模型工具名、不给 schema」的工具。模型在系统提示里能看到一段 `<available-deferred-tools>` 清单（只有名字），知道有哪些工具存在，但拿不到调用参数的 schema，因此暂时**看得见、调不了**。工具本体仍然完整挂在 ToolNode 里，只是 schema 对模型隐藏了——这是「可见性」和「可执行性」的解耦。
+
+  **② 怎么装配延迟集**：我不是硬编码哪些工具延迟，而是用元数据标签驱动——凡是带 `deerflow_mcp` 标签的工具（`is_mcp_tool`）就被纳入延迟集。装配期由 [`build_deferred_tool_setup()`](backend/packages/harness/deerflow/tools/builtins/tool_search.py:172) 把这些工具塞进一个不可变的 [`DeferredToolCatalog`](backend/packages/harness/deerflow/tools/builtins/tool_search.py:63)，并追加一个 `tool_search` 工具。这个 catalog 是 `@dataclass(frozen=True)`，`names` 和 `hash` 用 `cached_property` 缓存——这里有个细节：frozen 故意**不加 slots**，因为要保留 `__dict__` 让 cached_property 能写缓存，加了 slots 运行时会炸。
+
+  **③ 模型怎么解锁（tool_search）**：模型需要某个工具时，调 [`tool_search`](backend/packages/harness/deerflow/tools/builtins/tool_search.py:139)，支持三种查询语法——`select:Read,Edit`（按名精确取，不限量，因为是模型点名要的，截断会静默丢它需要的）、`notebook jupyter`（关键词打分排序取 top5，name 命中权重 2、description 权重 1）、`+slack send`（要求 name 含 slack、其余排序）。命中后返回工具完整 schema，并用 `Command(update={"promoted": {catalog_hash, names}, "messages": [...]})` **把提升写进图状态**——注意是图状态、不是全局变量，天然线程隔离、可随 checkpoint 持久化、可回放。
+
+  **④ schema 怎么藏、未提升怎么拦（双保险）**：这由 [`DeferredToolFilterMiddleware`](backend/packages/harness/deerflow/agents/middlewares/deferred_tool_filter_middleware.py:1) 两个钩子完成——`wrap_model_call` 里计算 `hidden = deferred - promoted`，用 `request.override(tools=active)` 把未提升工具的 schema 从绑定列表剔除，模型压根看不到；`wrap_tool_call` 里再做一道执行门禁，即使模型从历史消息学到工具名、硬凑一个调用，只要它在 hidden 集合里就返回一条 `status="error"` 的 ToolMessage，引导它先去 `tool_search`。**隐藏 schema 省 token，执行拦截防越权**，两道防线互补。
+
+  除此之外我还加了**自动提升**：[`McpRoutingMiddleware`](backend/packages/harness/deerflow/agents/middlewares/mcp_routing_middleware.py:1) 挂在 `before_model`，按用户输入的关键词（casefold 子串匹配路由表、按 priority 取 top_k）提前 promote，省去模型每次都主动检索。它**必须先于** DeferredToolFilter 执行——否则本轮提升不生效、schema 仍被藏——这个硬约束用 `assert_mcp_routing_before_deferred_filter` 启动期断言兜底。
+
+- **R（结果）**：模型只为真正用到的工具付 schema token，工具爆炸场景下上下文可控；同时可见/可执行解耦保证不误调用，一套装配被 lead/client/subagent 三条路径复用。（**具体 token 降幅本仓库未提供，属未知，不虚构。**）
+
+🧠 **考察**：token 成本意识 + 状态机设计 + 安全边界（可见 ≠ 可执行）+ 元数据驱动装配。
+
+📚 **底层原理**：
+- LLM function calling 的 schema 占上下文，工具越多越贵；
+- LangChain `bind_tools`（决定模型看到的 schema）与 `ToolNode`（决定实际能执行谁）是两套东西，延迟工具正是钻这个缝隙；
+- LangGraph 图状态 + `Annotated[..., reducer]` 做状态合并与持久化；
+- 闭包捕获 `catalog_hash`，让 tool_search 写入的提升带上目录版本。
+
+⚠ **常见错误**：
+- 把延迟工具答成「加缓存」——问题不是重复计算，是 schema 绑定量；
+- 以为「模型看不到 schema 就一定调不了」——模型可能从历史消息学到工具名硬调，所以必须有 `wrap_tool_call` 执行拦截；
+- 说不清工具本体一直在 ToolNode 里、只是 schema 被藏。
+
+⭐⭐⭐⭐⭐ **加分**：主动补两个护栏——
+1. **catalog_hash 防目录漂移**：`promoted` 带一个目录内容哈希（对排序后每个工具的 name+schema 求 SHA-256 取前 16 位）。reducer [`merge_promoted()`](backend/packages/harness/deerflow/agents/thread_state.py:107) 逻辑是：hash 变了→整体替换丢弃旧 names（防旧 checkpoint 里的提升记录暴露改名/换 schema 后的工具），hash 相同→union 去重保序。这是「持久化状态用内容哈希做版本护栏」的经典手法，无需人工维护版本号。
+2. **fail-closed 装配**：[`assemble_deferred_tools()`](backend/packages/harness/deerflow/tools/builtins/tool_search.py:187) 里，如果 tool_search 启用、有 MCP 候选、却没恢复出延迟集，**直接抛错拒绝绑定**，而不是静默把 MCP schema 全暴露——宁可失败也不泄露。
+3. 外部 MCP 工具名是不可信输入，渲染 `<available-deferred-tools>` 时用 `html.escape` 转义，防止精心构造的工具名闭合标签伪造框架标签（提示注入面）。
+
+### 问题 6：你怎么知道要调用哪些工具呢？
+
+> 这是紧承「延迟工具」的追问，考察你是否分得清「谁在做选择」——是模型自主决策、还是框架侧路由，以及延迟工具场景下「发现」和「选择」的链路。
+
+⭐ **高分回答（STAR）**
+
+- **S（背景）**：我要先纠正一个前提——**不是「我」（框架）决定调哪个工具，而是大模型基于上下文自主决策的**。框架做的是「把正确的候选、正确的 schema、正确的引导喂给模型」，让它更容易做出正确选择。所以这个问题要分「谁选」「怎么发现」「怎么被引导」三层来答。
+
+- **T（目标）**：在工具很多、还有延迟工具（初始无 schema）的情况下，既要让模型能选对工具，又要控制 token 成本、避免它误选或漏选。
+
+- **A（我怎么做的）**：
+
+  **① 普通工具——模型自主决策（标准 function calling）**：非延迟的工具会把完整 schema（名字 + 参数 + description）绑定给模型。模型读到用户意图后，靠这些 schema 里的 description 判断该调谁、传什么参。**description 写得好不好，直接决定选对率**，所以工具描述本身就是「路由信号」。这一层完全是模型决策，框架不干预。
+
+  **② 延迟工具——两段式「先发现、再选择」**：延迟工具初始只在系统提示的 `<available-deferred-tools>` 里露出名字、没有 schema，模型「知道有这个东西但还不能调」。它想用时，先调 [`tool_search`](backend/packages/harness/deerflow/tools/builtins/tool_search.py:139) 检索（`select:` 精确点名 / 关键词打分 / `+require`），命中后才拿到完整 schema 并解锁——**这一步是模型主动「发现」，选择权仍在模型**。框架只保证「名字可见、schema 按需给」。
+
+  **③ 框架侧自动提升——关键词路由降低发现成本**：完全靠模型主动 tool_search 有时会漏（它可能没意识到某个 MCP 工具能帮上忙）。所以我加了 [`McpRoutingMiddleware`](backend/packages/harness/deerflow/agents/middlewares/mcp_routing_middleware.py:27)，挂在 `before_model` 钩子。它的逻辑是：取**最近一条真实用户消息**的文本（`_latest_user_message` 从后往前找、`is_real_user_message` 过滤掉工具消息/系统消息），`casefold()` 后与每个延迟工具的路由关键词做子串匹配，命中的按 `priority` 降序、名字升序排序取 `top_k`，然后写进 `promoted` 状态提前解锁。这样**用户一提到「slack」「jira」这类词，相关 MCP 工具的 schema 就自动对模型可见了**，不用模型自己先去搜。
+
+  **④ prompt hints——把路由意图直接告诉模型**：光解锁 schema 还不够，我还会渲染一段 `<mcp_routing_hints>`（`get_mcp_routing_hints_prompt_section`）写进系统提示，明确告诉模型「当用户请求涉及 X 关键词时，优先用 Y 工具」；如果该工具还处于延迟态，hint 会先引导它「用 tool_search 取到 Y 再用」。**这等于把选工具的先验知识显式喂给模型**。
+
+  这里有个必须守住的**顺序约束**：自动提升的 `McpRoutingMiddleware`（before_model）必须先于 `DeferredToolFilterMiddleware`（wrap_model_call 里过滤 schema）执行，否则本轮 promote 还没写进状态、schema 就已经被过滤掉了，自动提升白做。我用 `assert_mcp_routing_before_deferred_filter` 在启动期断言这个顺序，装反了直接抛错。
+
+- **R（结果）**：普通工具靠 schema description 让模型自主选；延迟工具靠「tool_search 主动发现 + 关键词自动提升 + prompt hints 引导」三管齐下，既控 token 又不漏选。**核心判断权始终在模型，框架负责『把该看到的让它看到、把该知道的告诉它』。**
+
+🧠 **考察**：是否理解「工具选择是模型决策而非框架硬编码」，以及延迟工具下「发现」与「选择」的分层、自动提升的匹配机制。
+
+📚 **底层原理**：
+- LLM function calling：模型读 schema 的 name/description/参数决策，description 是关键路由信号；
+- 中间件 `before_model` 钩子在每次调模型前介入，可改图状态；
+- casefold 大小写归一化的子串匹配（零依赖、快、可解释）。
+
+⚠ **常见错误**：
+- 答成「框架用规则决定调哪个工具」——错，普通工具完全是模型自主决策；
+- 把自动提升说成「替模型选了工具」——它只是**解锁 schema 让工具可见**，最终调不调仍是模型定；
+- 忽略「最近真实用户消息」这个细节，说成「拿所有消息匹配」——那样会被历史/工具消息污染。
+
+⭐⭐⭐⭐⭐ **加分**：
+1. 主动点出 `McpRoutingMiddleware` **只收扁平可序列化的 routing_index，不持有 BaseTool、不执行、不过滤**——职责单一，过滤仍归 DeferredToolFilter，避免中间件互相耦合。
+2. 主动承认局限：关键词是**子串匹配**，处理不了同义词/多语言（比如用户说「发消息到聊天工具」但没提「slack」就匹配不上），未来可升级为语义向量匹配，但那要引入 embedding 模型、带来延迟和成本，当前规模下子串匹配够用且可解释。
+3. 点出 `top_k` 有上限钳制（`clamp_auto_promote_top_k`），防止一次自动提升过多工具反而把上下文撑爆——自动提升本身也要克制。
+
+### 问题 7：哪些应该作为全量工具？哪些应该作为延迟工具？
+
+> 考察你的划分标准是否有原则，而不是拍脑袋。这里要给出「判据 + 为什么这么定 + 边界」。
+
+⭐ **高分回答（STAR）**
+
+- **S（背景）**：延迟工具能省 token，但延迟是有代价的——模型要多一步 `tool_search` 才能用，会增加一轮交互、拉长链路。所以不是「工具越多越该延迟」，得有明确划分标准。
+
+- **T（目标）**：找到一条能自动执行、稳定、可解释的划分规则，让「高频/核心工具零摩擦、低频/海量工具省 token」。
+
+- **A（我的划分标准）**：本项目的判据非常明确——**只有带 `deerflow_mcp` 标签的工具（`is_mcp_tool` 为真）才进延迟集，其余全部全量绑定**。这条规则在 [`build_deferred_tool_setup()`](backend/packages/harness/deerflow/tools/builtins/tool_search.py:172) 里就一行 `[t for t in candidate_tools if is_mcp_tool(t)]`。具体分两类讲：
+
+  **① 全量工具（默认，直接绑 schema）**：
+  - **内置工具**：`present_files`、`ask_clarification`、`view_image`、`task`（子智能体）、以及 `tool_search` 自己——这些是 Agent 的「基础能力」，几乎每个任务都可能用，数量少、语义固定，延迟它们反而制造无谓的检索开销。尤其 `tool_search` 自己**绝不能延迟**，否则模型没法发现别的延迟工具，成了死锁。
+  - **沙箱工具**：`bash`/`ls`/`read_file`/`write_file`/`str_replace` 等，高频核心操作，必须零摩擦。
+  - **配置里的社区工具**：搜索（Tavily/Brave…）、抓取（Jina/Firecrawl…）等，虽然 Provider 多，但它们是当前 Agent 明确配置启用的、用途集中，数量可控，也走全量。
+
+  **② 延迟工具（只有 MCP）**：
+  - **MCP 服务器工具**：这是延迟的唯一来源。原因很实在——MCP 是**用户可任意挂载**的，数量完全不可控（可能几十上百个），而且每个用户/场景实际会用到的往往只是其中一小撮。把这种「海量、长尾、不可预测」的工具全量绑定，就是典型的工具爆炸。所以装配期给 MCP 工具打 `deerflow_mcp` 标签（`tag_mcp_tool`），延迟集专门收它们。
+
+- **R（结果）**：一句话概括判据——**「框架内置 + 明确配置启用」的走全量（少而核心、高频），「用户可任意挂载的 MCP」走延迟（多而长尾、不可控）**。标准客观（靠元数据标签，不靠人工枚举），且天然对 token 成本敏感。
+
+🧠 **考察**：划分是否有原则、是否理解「延迟有交互成本」、是否想到 tool_search 自身不能延迟这个死锁点。
+
+📚 **底层原理**：
+- 延迟的收益是省 schema token，成本是多一轮 tool_search 交互——所以只对「省得多、用得少」的工具延迟才划算；
+- 元数据标签（`deerflow_mcp`）驱动划分，判据集中在一处（`mcp_metadata.py`），魔法字符串只存在一份。
+
+⚠ **常见错误**：
+- 说「按工具数量阈值划分」——本项目不是按数量，而是**按来源/可控性**（MCP vs 非 MCP）；
+- 把高频沙箱工具（bash 等）也延迟——那会让最常用的操作每次都要先检索，得不偿失；
+- 忘了 `tool_search` 自己必须全量——延迟它会导致模型无法发现任何延迟工具，链路死锁。
+
+⭐⭐⭐⭐⭐ **加分**：
+1. 用一条「成本收益」原理串起来：**延迟 = 拿「一轮检索交互」换「schema token」**。只有当工具「数量大且单次任务命中率低」时，这笔交换才划算——MCP 正好符合，内置/沙箱不符合。
+2. 指出这条规则是**来源判据而非枚举判据**，所以新增任意 MCP 服务器都自动进延迟集、无需改代码；反之新增一个内置工具也自动全量，扩展性好。
+3. 主动提边界：如果未来某类**非 MCP** 的工具也膨胀到不可控（比如插件市场），可以复用同一套机制——给它们也打上「可延迟」标签即可，划分逻辑不用重写，因为延迟集判据本质是「是否带某个元数据标签」，MCP 只是当前唯一的标签来源。
+
+### 问题 8：tool_search 你是如何实现的？根据什么来判断查询应该返回哪个工具？
+
+> 深挖 tool_search 的实现与匹配算法。要讲清「工具本身怎么构造」和「search 根据什么打分排序」两层。
+
+⭐ **高分回答（STAR）**
+
+- **S（背景）**：延迟工具初始只露名字、没 schema，模型要用 `tool_search` 才能拿到 schema 并解锁。所以 tool_search 要解决的是「模型给一段查询，我在延迟目录里挑出最匹配的工具、返回它们的完整 schema」。
+
+- **T（目标）**：查询是**模型生成的、不可信**的，可能是精确名、也可能是模糊关键词、还可能是非法正则；要在保证不崩溃、可解释的前提下，返回最相关的工具，并控制返回数量省 token。
+
+- **A（怎么实现的）**：分两部分——
+
+  **① 工具本身怎么构造**：`tool_search` 是用 [`build_tool_search_tool()`](backend/packages/harness/deerflow/tools/builtins/tool_search.py:139) 以**闭包**方式生成的，闭包捕获了当前延迟目录的 `catalog_hash`。它是个标准 LangChain `@tool`，入参是 `query` 和注入的 `tool_call_id`。命中后不直接返回文本，而是返回一个 `Command(update={"promoted": {"catalog_hash", "names"}, "messages": [ToolMessage(...)]})`——**一次同时干两件事**：把命中工具写进 `promoted` 图状态解锁，同时把它们的完整 OpenAI function schema（`convert_to_openai_function`）作为 ToolMessage 回给模型。没命中就返回 `No tools found matching: {query}` 且 names 为空。
+
+  **② search 根据什么判断返回哪个工具**：核心在 [`DeferredToolCatalog.search()`](backend/packages/harness/deerflow/tools/builtins/tool_search.py:76)，我设计了**三种查询语法**，对应模型三种意图：
+
+  - **`select:Read,Edit`（精确点名）**：模型已经知道确切工具名，逗号分隔。这种**不做数量截断**——因为是模型明确点名要的，截断会静默丢掉它需要的工具（这点和 `SkillCatalog.search` 保持一致）。
+  - **`+slack send`（require 过滤 + 排序）**：`+` 后第一个 token 是**硬性要求**——工具 name 里必须含 `slack`；剩下的 `send` 用来在候选里排序。适合「我要某一类工具里最匹配的那个」。
+  - **`notebook jupyter`（关键词模糊搜索）**：默认模式，把查询当正则在「name + description」里搜。**打分规则是：命中 name 权重 2、只命中 description 权重 1**，降序排序后取前 `MAX_RESULTS=5` 个。为什么 name 权重更高？因为工具名比描述更能代表工具身份，名字命中说明相关度更强。
+
+  **③ 三个关键的健壮性/成本设计**：
+  - **非法正则降级**：查询来自模型，可能是不合法的正则（比如括号不配对）。[`_compile_catalog_regex()`](backend/packages/harness/deerflow/tools/builtins/tool_search.py:45) 捕获 `re.error`，降级成 `re.escape` 的字面量匹配，**绝不抛异常**——这是不可信输入的信任边界处理。
+  - **数量上限**：模糊/require 模式都截断在 `MAX_RESULTS=5`，防止一次返回太多 schema 把 token 撑爆；只有 `select:` 精确点名例外。
+  - **空查询直接返回空**：`query.strip()` 为空短路。
+
+- **R（结果）**：一段模型查询能被稳定地翻译成「最相关的 ≤5 个工具 schema」，三种语法覆盖「精确 / 限定类别 / 模糊探索」三种意图，且对非法输入零崩溃、对 token 有节制。判断依据一句话：**select 按名精确取，+ 按 name 硬过滤再排序，默认按正则在 name/description 上打分（name 权重 2 > description 权重 1）取 top5。**
+
+🧠 **考察**：匹配算法设计、不可信输入处理、token 成本节制、以及「返回 schema + 写状态」一次完成的意图表达。
+
+📚 **底层原理**：
+- 闭包捕获 catalog_hash，让每次解锁都带上目录版本（配合 catalog_hash 防漂移）；
+- `Command(update=...)` 能一次更新多个 state key 并控制路由，比返回纯 dict 表达更完整；
+- 正则打分是简单的「命中位置加权」——name 命中比 description 命中更值钱。
+
+⚠ **常见错误**：
+- 只说「关键词匹配」，讲不出 name/description 的权重差异；
+- 忽略 `select:` 不截断、其他模式截断 top5 的区别；
+- 不处理模型给的非法正则——直接 `re.compile` 会抛异常让工具崩溃；
+- 以为 tool_search 只返回 schema——它同时写 `promoted` 状态解锁，是「发现 + 授权」一步完成。
+
+⭐⭐⭐⭐⭐ **加分**：
+1. 主动承认**这是线性扫描 + 正则**（O(N·regex)），工具数不大时够快、够可解释；工具极多时可上倒排索引或语义向量检索，但会引入构建/维护成本和延迟，当前规模下不划算。
+2. 指出打分是**词法层面**的，处理不了同义词（用户搜「表格」搜不到名为 spreadsheet 的工具），语义匹配是未来演进方向。
+3. 点出 catalog 是 `frozen dataclass` 且 `names`/`hash` 用 `cached_property` 缓存——search 每次调用不重算目录哈希，只在首次访问时算一次。
+
 ---
 
 ## 十、架构 Trade-off
