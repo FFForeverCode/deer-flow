@@ -509,6 +509,65 @@ L6 子智能体共享父 thread_id 会不会读到旧的错误标记？
 
 **⭐⭐⭐⭐⭐**：明确"单进程可靠、多 worker 需共享存储、当前未实现"，并点出 Gateway 默认 GATEWAY_WORKERS=1（README）故单 worker 场景够用。
 
+### 问题 4：task() 是什么意思？
+
+> 这是对"主智能体通过 task() 派生子智能体"这句话的追问，考察你是否清楚它到底是个什么东西、怎么用、参数是什么。
+
+**⭐ 高分回答**
+
+- **一句话**：`task` 是一个**内置工具（tool）**，是主智能体用来**派生（委派）子智能体**的唯一入口。主智能体想把一个子任务甩给子智能体去做时，就调用 `task` 这个工具——它不是普通函数，而是像 `web_search`、`bash` 一样、暴露给大模型的一个可调用工具（`tools/builtins/task_tool.py`，`@tool("task")`）。
+
+- **它做什么**：`task` 的语义就是「**把一个任务委派给一个跑在独立上下文里的专项子智能体**」。模型发起一次 `task` 调用，框架就为这个子任务创建一个 `SubagentExecutor`，在独立事件循环里启动一个子智能体去执行，做完把结论结构化回传。主智能体一次响应里可以发多个 `task` 调用，从而**并行派生多个子智能体**（受双层限流约束）。
+
+- **三个参数**（模型调用时必须给，顺序在 docstring 里强制）：
+  - `description`：3-5 个词的**任务简述**，仅用于日志/展示；
+  - `prompt`：**给子智能体的具体任务描述**，要清晰具体地说明要做什么（这就是子智能体的"工单"）；
+  - `subagent_type`：**用哪种子智能体**，内置 `general-purpose`（复杂多步任务通用型）和 `bash`（命令执行专家，仅在允许宿主 bash 或用隔离沙箱时可用），也可在 config.yaml��自定义类型；类型不存在会返回错误并列出可用类型。
+
+- **什么时候用 / 不用**（docstring 里明确写给模型看）：
+  - **用**：复杂多步、输出冗长、想隔离上下文、可并行的探索/调研任务；
+  - **不用**：简单单步操作（直接用工具即可）、需要用户交互澄清的任务。
+
+- **为什么它是"工具"而不是内部 API**：因为要让**模型自主决定何时拆分、拆成几个子任务、每个交给哪种子智能体**——把派生能力做成工具，模型才能在 function calling 里自然地调用它。这也是为什么子智能体默认 `disallowed_tools=["task"]`——**不给子智能体 task 工具，从机制上断掉"子智能体再派生子智能体"的无限套娃**。
+
+**🧠 考察什么**：是否理解 task 是"暴露给模型的派生工具"这一本质，而非某种后台调度函数。
+
+**📚 底层原理**：LangChain `@tool` 把 task_tool 包成带 schema 的工具；模型返回 `task` 的 tool_call → 经 SubagentLimitMiddleware 限流 → task_tool 构造 SubagentExecutor 派生子智能体。
+
+**⚠ 常见错误**：
+- 把 task 说成"一个线程/进程"——它是**工具**，派生出的子智能体才跑在独立循环/线程里；
+- 说不清三个参数各是什么、尤其混淆 `description`（日志用）和 `prompt`（真正的任务）；
+- 忘了它默认对子智能体禁用（防套娃）。
+
+**⭐⭐⭐⭐⭐**：主动点出 `task` 是异步工具（`async def`）、返回 `str | Command`，且 docstring 里对参数顺序做了强约束（"ALWAYS PROVIDE THIS PARAMETER FIRST/SECOND/THIRD"）——因为参数顺序影响模型的流式生成体验，这是"用 docstring 引导模型"的细节。
+
+### 问题 5：大模型怎么知道选哪个子 agent？你一共有哪些子 agent？
+
+> 考察你是否清楚"选择依据"这条链路，以及对可选子 agent 的掌握。
+
+**⭐ 高分回答**
+
+- **先答有哪些**：内置**两个**子 agent（`subagents/builtins/__init__.py` 的 `BUILTIN_SUBAGENTS`）：
+  - **`general-purpose`**：通用型，处理需要探索 + 行动的复杂多步任务；继承父级全部工具（`tools=None`），max_turns=150。
+  - **`bash`**：命令执行专家，只有沙箱工具（`bash`/`ls`/`read_file`/`write_file`/`str_replace`），max_turns=60；且**仅在允许宿主 bash 或用隔离沙箱（如 AioSandboxProvider）时可用**，否则调用会返回禁用错误。
+  
+  此外**支持自定义**：在 config.yaml 的 `subagents.custom_agents` 下可定义任意数量子 agent，每个能配自己的 system_prompt、工具、技能、模型、超时。所以准确说法是"内置 2 个 + 可自定义任意个"。
+
+- **模型怎么选**：靠 `task` 工具的 `subagent_type` 参数——模型调 `task(description, prompt, subagent_type)` 时，`subagent_type` 就是它做的选择。**选择依据是每个子 agent 的 `description` 字段**（`SubagentConfig.description`），这些描述被暴露给模型，而且写得很有讲究——不只是说"这个 agent 能干嘛"，还明确写了 **"Use this subagent when...（何时用）" 和 "Do NOT use for...（不该用）"**。例如 general-purpose 写"需要探索+修改、多步依赖、需隔离上下文时用，简单单步别用"，bash 写"跑一系列相关命令、git/npm/docker、构建测试部署时用，单条简单命令别用直接调 bash 工具"。**description 就是给模型的选择说明书**——和普通工具靠 schema description 选工具是同一个道理。
+
+- **兜底**：`task` 工具的 docstring 里也内联列了内置类型说明；如果模型传了**未知的 subagent_type**，task_tool 会返回错误消息并**列出所有可用类型**（`get_available_subagent_names()`），引导模型改用合法类型。
+
+**🧠 考察什么**：是否理解"子 agent 选择 = 模型基于 description 的自主决策"，而非框架规则路由。
+
+**📚 底层原理**：和工具选择同源——把每个子 agent 的 description（含 when/when-not）喂给模型，模型据此填 `subagent_type`；registry 负责把内置 + 自定义子 agent 统一暴露。
+
+**⚠ 常见错误**：
+- 说"框架按规则自动分配子 agent"——错，是**模型自己选**，框架只提供候选和描述；
+- 只记得 general-purpose、漏掉 bash，或不知道 bash 有可用性前提（需隔离/允许宿主 bash）；
+- 不知道可通过 config 自定义，把"只有 2 个"说死。
+
+**⭐⭐⭐⭐⭐**：主动点出 description 里的 **"Do NOT use for..."** 反向引导——好的子 agent 描述不仅告诉模型"能用它做什么"，还告诉它"别拿它做什么"（简单单步任务直接用工具），这直接影响模型选择的准确率，是"description 即路由信号"在子 agent 维度的体现。
+
 ## 第五部分：源码分析
 
 | 元素 | 位置 | 为什么这样写 | 为什么不是另一种 | 设计思想/潜在问题 |
@@ -541,4 +600,44 @@ L6 子智能体共享父 thread_id 会不会读到旧的错误标记？
 | 无锁 CAS | 无锁开销低 | Python 层无原语、易错 | 用 threading.Lock 更直白正确 |
 
 > **面试铁律**：MQ、Redis、分布式锁、MySQL 在本项目**代码中没有实现**。被问只能答"本项目是进程内 Agent 运行时，不涉及；扩展多 worker 全局限流可引入 Redis，但我没在这个项目里做过"。**绝不说成做过。**
+
+---
+
+# 附录二：简历产出总结（可直接摘取）
+
+> 从全文提炼的、可写进简历的「项目产出」。提供四种粒度：一句话概述、分条产出、STAR 要点、技术关键词。**严格遵循全文的诚实原则**：只写代码真实实现的能力；量级/QPS 未知不虚构；不涉及 MQ/Redis/分布式锁/MySQL。
+
+## A. 简历一句话版（放在项目标题下）
+
+> 设计并实现 AI Agent 运行时的**子智能体系统**：主智能体通过 `task()` 工具按需派生子智能体，用「独立事件循环 + 线程池并行 + 上下文隔离 + 双层硬限流 + 终态一致性 + 部分结果回收」将复杂长任务分治为多个独立上下文的子任务并行执行再收敛，解决单 Agent 的上下文爆、串行慢、易污染三大瓶颈。
+
+## B. 简历分条产出版（推荐，3-5 条，每条一个亮点）
+
+- **并行执行引擎（生命周期解耦）**：设计基于**独立常驻事件循环 + 专用 daemon 线程**的子智能体执行引擎，主线程用 `run_coroutine_threadsafe` 跨线程提交协程，使子智能体的长时异步生命周期与主 HTTP 请求彻底解耦——主循环不被阻塞、主请求取消/超时不误伤子任务，进程退出时 atexit 优雅关闭。
+
+- **ContextVar 跨线程还原**：针对 ContextVar 默认不跨线程导致鉴权失败/trace 断链的问题，用 `copy_context()` 抓取上下文快照 + `context.run()` 在目标循环还原，保证 user_id、trace_id、鉴权属性在子智能体线程中完整可用。
+
+- **双层硬限流（机制而非约定）**：实现 `SubagentLimitMiddleware` 在 `after_model` 阶段硬截断超额 `task` 调用——并发上限（默认 3，钳制 [2,4]）限制单次响应派生数，总量上限（默认 6，钳制 [1,50]）用 run_id 维度委派账本限制整个 run 累计派生数，耗尽注入停止提示并打 `stop_reason` 标记，从机制上防止模型无限派生烧 token。
+
+- **终态一致性与部分结果回收（容错）**：用 `threading.Lock` 保护的 check-then-set 实现「终态只写一次（first-writer-wins）」，解决执行 worker/超时监控/取消事件三方竞争写结果的一致性问题；用 `recursion_limit` 兜最大轮次，触发时从最后 state chunk 回收已完成的部分成果（capped ≠ failed）并用 stop_reason 区分"干净完成/被截断"，实现优雅降级。
+
+- **上下文隔离与可配置策略**：子智能体在独立 state 运行（`checkpointer=False`），内部 AI/工具消息不进入主对话流、只结构化回传结论（解决"上下文墙"根本）；支持工具 allowlist/denylist（默认禁 `task` 断无限套娃）、模型 inherit/独立、技能白名单等分层策略。
+
+## C. 简历 STAR 版（面试口述/自我介绍用）
+
+- **S（背景）**：AI Agent 处理需几十步、上百次工具调用的复杂长任务时，单 Agent 会撞上下文爆、只能串行、长上下文被污染难恢复三堵墙。
+- **T（目标）**：用分治思想把大任务拆给多个独立上下文的子 Agent 并行执行，同时控成本、保鲁棒、保链路。
+- **A（行动）**：主智能体经 `task()` 按需派生子智能体；独立事件循环 + 线程池并行并与主请求解耦；copy_context 保 ContextVar 跨线程；中间件做并发 + 总量双层硬限流；recursion_limit 兜轮次并回收部分成果；终态加锁保 first-writer-wins；上下文隔离 + 结构化回传。
+- **R（结果）**：复杂任务能扇出多个子智能体并行完成再收敛，主上下文保持干净，成本被硬约束，部分失败不影响其余成果，全程可观测。
+
+## D. 技术关键词（供 ATS / 简历技能栏）
+
+Python asyncio 事件循环、run_coroutine_threadsafe 跨线程提交、ContextVar + copy_context 上下文传递、ThreadPoolExecutor、threading.Lock 并发安全、first-writer-wins 终态一致性、LangGraph 状态图 + recursion_limit、中间件限流、分治（Divide & Conquer）、上下文隔离、优雅降级、daemon 线程 + atexit 生命周期管理。
+
+## E. 使用建议
+
+- **应届/初级岗**：用 B 的前 2-3 条（并行引擎、ContextVar、双层限流），突出并发模型与工程化控制；
+- **高级/资深岗**：加上终态一致性与部分结果回收，突出容错与并发安全深度；
+- **务必按真实参与度裁剪**，面试会深挖（见附录追问树 A/B/C），只写自己能讲透的；
+- **诚实边界（重要）**：本项目是进程内 Python Agent 运行时，**不涉及 MQ/Redis/分布式锁/MySQL**；委派账本是 LangGraph state 字段非外部存储；"终态只赢一次"是锁保护的 check-then-set、**不是硬件 CAS**，别硬套术语；**量级/QPS 无线上数据，勿虚构**，可讲"设计容量参数"（并发 3、总量 6、max_turns 150/60、timeout 1800s）。
 

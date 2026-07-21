@@ -624,6 +624,166 @@ MCP 工具名来自外部服务器，是**不可信输入**。渲染进 `<availa
 2. 指出打分是**词法层面**的，处理不了同义词（用户搜「表格」搜不到名为 spreadsheet 的工具），语义匹配是未来演进方向。
 3. 点出 catalog 是 `frozen dataclass` 且 `names`/`hash` 用 `cached_property` 缓存——search 每次调用不重算目录哈希，只在首次访问时算一次。
 
+### 问题 9：你说的「接入 20+ 社区 Provider」是什么意思？
+
+> 这是对简历/自述里"20+ 社区 Provider"这句话的追问，考察你是否真的清楚工具来源、以及这个数字背后代表什么。答不清会被认为在堆数字。
+
+⭐ **高分回答（STAR）**
+
+- **S（背景）**：Agent 靠工具与外部世界交互，其中很大一部分能力（联网搜索、抓取网页正文）不是我们自己实现，而是集成第三方服务。
+
+- **T（目标）**：把这些异构的第三方服务统一包装成模型可调用的工具，并且让新增/切换一个服务成本很低。
+
+- **A（是什么）**：所谓「社区 Provider」，就是**把一个第三方服务集成、包装成 Agent 工具的模块**，代码统一收拢在 `deerflow/community/` 目录下，每个子目录就是一个 Provider。主要分两类：
+  - **搜索/抓取类**（文档强调的「工具爆炸」来源）：搜索有 Tavily、Brave、Serper、Exa、DuckDuckGo、SearXNG、image_search；抓取/爬取有 Jina AI、Crawl4AI、Firecrawl、fastCRW、InfoQuest、Browserless、GroundRoute——这一类就有十余个。
+  - **沙箱后端类 Provider**：aio_sandbox（Docker）、e2b_sandbox（云）、boxlite（轻量容器），负责命令/文件执行的隔离环境。
+  
+  `community/` 下的集成总数（搜索 + 抓取 + 沙箱后端等）大约 20 个，所以说「20+」。它们都通过配置 `config.tools` 的 `use` 字段反射装配，业务代码只面向统一的工具/接口，新增一个 Provider 基本是"加一个目录 + 一行配置"。
+
+- **R（为什么重要）**：这个数字不是为了堆量，而是引出真正的痛点——**每个 Provider 的工具 schema 都要占模型上下文**，十几个搜索/抓取工具的 schema 叠加起来已经不小；再加上用户可**任意挂载**的 MCP 服务器（数量完全不可控），就构成「工具爆炸」。这正是延迟工具（初始只给名字、按需暴露 schema）要解决的问题。所以「20+ 社区 Provider」是延迟工具设计的**问题背景**，两者是因果关系。
+
+🧠 **考察**：是否清楚工具的真实来源与组织方式、数字背后的工程含义。
+
+📚 **底层原理**：反射装配（`resolve_variable(cfg.use)` 按配置字符串加载工具类）让多 Provider 可插拔；schema 占 token 是"工具爆炸"的本质。
+
+⚠ **常见错误**：
+- 把「Provider」笼统说成"就是很多工具"——它是**第三方服务的集成模块**，一个 Provider 可能暴露一个或多个工具；
+- 只报数字答不出具体有哪些、怎么组织的——会显得在背简历。
+
+⭐⭐⭐⭐⭐ **加分**：
+1. 主动说清「社区 Provider（内置可选集成）」和「MCP 服务器（用户运行期任意挂载）」是**两个不同来源**：前者数量相对固定、我们可控，后者数量不可控——延迟工具当前只延迟 MCP，社区工具走全量（呼应"哪些该延迟"那题）。
+2. 严谨表述建议：具体数量以代码为准，面试中说「十余个社区搜索/抓取 Provider + 若干沙箱后端 + 任意数量 MCP」比硬报"20+"更稳，不易被追问确切数字。
+
+### 问题 10：把第三方服务包装成 Agent 工具，你是怎么包装的？工具又是怎么被调用的？
+
+> 深挖 Provider 的实现细节和工具调用链。要分「包装（怎么变成工具）」和「调用（怎么被执行）」两段，且要落到真实代码的写法上。
+
+⭐ **高分回答（STAR）**
+
+- **S（背景）**：社区 Provider 要把 Tavily、Jina 这类第三方 HTTP 服务，变成大模型能理解、能调用的「工具」。
+
+- **T（目标）**：让包装成本极低（加个模块 + 一行配置就能上一个新 Provider），同时工具的 schema、配置、执行三者解耦、可复用。
+
+- **A（怎么包装的）**：以本仓库真实写法讲，一个 Provider 工具就三层：
+
+  **① `@tool` 装饰器 + docstring 自动生成 schema**：工具本质是一个普通 Python 函数，用 LangChain 的 `@tool("web_search", parse_docstring=True)` 装饰。函数的**类型注解**（`query: str`）生成参数 schema，**docstring** 生成工具描述（`parse_docstring=True` 会把 `Args:` 段解析成每个参数的说明）。这就是模型看到的 function schema——**description 写得清不清楚，直接决定模型选不选它、传参对不对**，所以 docstring 是核心。
+
+  **② 配置解耦**：工具函数体里不硬编码 api_key、max_results，而是通过 `get_app_config().get_tool_config("web_search")` 读配置（`config.model_extra` 里拿 api_key、max_results 等），配置来自 `config.tools`。这样同一份代码，换个 key/参数就能复用，密钥也不进代码。
+
+  **③ Client 封装 + 结果归一化**：真正调第三方 API 的逻辑封装在独立的 Client 类里（如 `JinaClient.crawl` 用 httpx 发请求、`TavilyClient.search`）。工具函数拿到原始返回后**归一化成模型友好的格式**——比如 Tavily 的 `web_search` 把结果整理成 `{title, url, snippet}` 的 JSON，Jina 的 `web_fetch` 把 HTML 用 readability 抽正文再转 markdown、截断到 4096 字符。归一化很关键：既省 token，又让模型拿到干净结构。
+
+  一句话概括包装：**`@tool` 装饰器（生成 schema）+ get_tool_config（读配置）+ Client 类（调 API）+ 结果归一化（省 token/模型友好）**，异步服务就用 `async def`。
+
+- **A（怎么被调用的）**：调用链分装配和运行两段——
+
+  **装配期（反射加载）**：配置里每个工具写 `use: deerflow.community.tavily.tools:web_search_tool`，`get_available_tools` 用 `resolve_variable(cfg.use)` **按这个字符串反射加载**到工具对象；async-only 的工具会被挂上同步壳（`make_sync_tool_wrapper`）；然后统一装配、去重、绑定给模型。
+
+  **运行期（模型决策 → ToolNode 执行）**：模型基于 schema 决定调哪个工具、生成一个 tool_call（工具名 + 参数 JSON）→ LangGraph 的 **ToolNode 按名字路由**到对应工具对象 → 执行函数体（发 HTTP、归一化）→ 把返回值包成 `ToolMessage` 塞回消息历史 → 下一轮模型读到结果继续决策。中间还会经过中间件（如延迟工具的 schema 过滤、执行拦截；结果脱敏）。
+
+- **R（结果）**：新增一个 Provider 只要写一个带 `@tool` 的函数 + 一行 `use` 配置，业务代码零改动；工具的 schema/配置/执行三者解耦，模型侧只面向统一的 function calling 协议。
+
+🧠 **考察**：是否真写过工具（而非只会用）、是否理解 schema 从哪来、调用链每一环。
+
+📚 **底层原理**：
+- LangChain `@tool` 把函数 + 类型注解 + docstring 转成带 JSON schema 的 `BaseTool`；
+- 反射装配 `resolve_variable(cfg.use)` 按"模块路径:符号"动态加载；
+- LangGraph ToolNode 按工具名路由执行，结果以 ToolMessage 回流。
+
+⚠ **常见错误**：
+- 说"schema 是手写 JSON"——实际是 `@tool` 从类型注解 + docstring 自动生成；
+- 忽略结果归一化——直接把第三方原始响应丢给模型，既费 token 又结构混乱；
+- 把 api_key 硬编码进函数——应走 `get_tool_config` + 环境变量。
+
+⭐⭐⭐⭐⭐ **加分**：
+1. 点出 **docstring 即 schema、即路由信号**——工具选对率很大程度取决于 description 质量，这是"写工具"和"写好工具"的分水岭。
+2. 指出**同名不同实现可互换**：web_search 可以是 DuckDuckGo/Tavily/Serper/Brave 任一实现，工具名都叫 `web_search`，改 `use` 一行就切换 Provider，模型完全无感——这是面向接口 + 反射装配带来的可插拔。
+3. 提结果归一化里的 **token 意识**：Jina 抽正文 + 截断 4096、Tavily 只留 title/url/snippet，都是刻意为模型上下文省 token。
+
+### 问题 11：parse_docstring 是什么？是框架自带的能力吗？做什么用？怎么用？
+
+> 深挖 `@tool(..., parse_docstring=True)` 里那个参数。考察你是否真理解工具 schema 从哪来，而不是照抄模板。
+
+⭐ **高分回答**
+
+- **是什么 / 是不是框架自带**：`parse_docstring` 是 **LangChain 框架 `@tool` 装饰器自带的一个参数**（不是我们自己实现的），布尔值，默认 `False`。它控制的是「**要不要解析函数的 docstring 来生成工具 schema 的描述信息**」。
+
+- **做什么用**：一个工具暴露给模型的 function schema 有两部分描述——**工具整体的 description**，和**每个参数的 description**。
+  - 不开 `parse_docstring` 时：整段 docstring 会作为工具的整体描述，但**各个参数没有单独的说明**；
+  - 开 `parse_docstring=True` 时：LangChain 会按 **Google 风格 docstring** 解析——把 docstring 正文当工具描述，把 `Args:` 段里每个参数的说明**对应填进各参数的 schema**。这样模型不仅知道"这个工具干嘛"，还知道"每个参数该传什么"，选参更准。
+
+- **怎么用**：就是在 `@tool` 里加 `parse_docstring=True`，然后按 Google 风格写 docstring——正文写工具用途，`Args:` 段逐个写参数。本项目所有工具都是这么写的，比如 Tavily 的 `web_search`：
+
+  ```python
+  @tool("web_search", parse_docstring=True)
+  def web_search_tool(query: str) -> str:
+      """Search the web.          # ← 这句成为工具的 description
+
+      Args:
+          query: The query to search for.   # ← 这句成为 query 参数的 description
+      """
+      ...
+  ```
+
+  最终模型看到的 schema 大致是：工具名 `web_search`、描述 "Search the web."、参数 `query`（string，描述 "The query to search for."）。**参数类型（string）来自类型注解 `query: str`，参数描述来自 docstring 的 Args 段**——两者配合，`@tool` 自动拼出完整 schema，我们不用手写任何 JSON。
+
+- **为什么重要（加分）**：
+  1. **docstring 直接变成模型的决策依据**——工具选没选对、参数传没传对，很大程度取决于这段描述写得清不清楚。所以在这套体系里，**写 docstring ≈ 写 prompt**，是有工程价值的活，不是可有可无的注释。
+  2. 有个**格式约束**：`parse_docstring=True` 要求 docstring 是合法的 Google 风格（有 `Args:` 段、格式规整），格式不对 LangChain 会解析失败/报错。所以团队里工具 docstring 的写法是统一的。
+  3. 呼应前面——正因为 schema 是从 docstring 自动生成的，延迟工具才能做到"只藏 schema、留名字"，`tool_search` 也能把 `convert_to_openai_function` 出来的完整 schema 返回给模型。
+
+🧠 **考察**：是否分得清"工具描述"和"参数描述"、是否知道 schema 是自动生成而非手写。
+
+⚠ **常见错误**：
+- 以为 `parse_docstring` 是项目自定义的——它是 LangChain `@tool` 的标准参数；
+- 以为它生成参数类型——**类型来自类型注解，`parse_docstring` 只负责参数的文字描述**；
+- 不写 `Args:` 段却开 `parse_docstring=True`——会因 docstring 不符合 Google 风格而解析报错。
+
+### 问题 12：Spring AI 有类似的工具能力吗？它是如何注册工具的？
+
+> 横向对比题。注意：**本项目是 Python + LangChain/LangGraph 实现，不涉及 Spring AI**。这道题考察你对 Agent 工具生态的横向理解——回答时先点明本项目不用它，再对比讲清 Spring AI 的对应做法，最后落回"思想是相通的"。（以下 Spring AI 细节为通用框架知识，非本仓库代码，具体 API 以对应版本官方文档为准。）
+
+⭐ **高分回答**
+
+- **先定位**：我们项目用的是 Python 生态（LangChain 的 `@tool` + LangGraph 的 ToolNode），没有用 Spring AI。但 Spring AI 作为 Java/Spring 生态的 AI 框架，**确实有对等的工具（Tool Calling / Function Calling）能力**，核心思想和 LangChain 是一致的——都是「把方法包装成带 schema 的工具，交给模型决策调用」。差别主要在语言习惯和注册方式。
+
+- **Spring AI 注册工具的几种方式**：
+
+  **① 注解式（最常用，对应 LangChain 的 `@tool`）**：在普通方法上加 `@Tool` 注解，用 `description` 属性写工具描述；参数上用 `@ToolParam` 注解写参数说明。这跟我们 `@tool` + docstring 是一个思路——**注解/docstring 提供描述，反射拿到方法签名生成参数 schema**。然后把这个带 `@Tool` 方法的对象通过 `ChatClient` 的 `.tools(toolObject)`（或构建 `ToolCallback`）注册给模型。
+
+  ```java
+  class WeatherTools {
+      @Tool(description = "Get weather by city")
+      String getWeather(@ToolParam(description = "city name") String city) { ... }
+  }
+  // 注册：
+  chatClient.prompt().user("北京天气？").tools(new WeatherTools()).call();
+  ```
+
+  **② 编程式（`FunctionToolCallback` / 函数 Bean）**：把一个 `Function<Input, Output>` 包装成 `ToolCallback`，显式指定名字、描述、输入类型 schema。适合动态构造工具、或工具逻辑就是个纯函数的场景——**对应 LangChain 里直接构造 `BaseTool` 对象**。
+
+  **③ Spring Bean 方式**：把函数注册成 Spring 容器里的 Bean，通过配置/名字引用注入给模型——这利用了 Spring 的 IoC，**类似我们用 `use: 模块路径:符号` 反射装配**，都是"按标识符把工具装进来"的解耦思路。
+
+- **和本项目的对应关系（体现你能抽象出共性）**：
+
+  | 能力 | 本项目（LangChain/LangGraph） | Spring AI |
+  |------|------------------------------|-----------|
+  | 声明工具 | `@tool` 装饰器 | `@Tool` 注解 |
+  | 参数描述 | docstring `Args:`（parse_docstring） | `@ToolParam(description=...)` |
+  | 参数类型 schema | 类型注解自动推 | 方法签名反射自动推 |
+  | 注册给模型 | `bind_tools` / 装配进 agent | `ChatClient.tools(...)` / `ToolCallback` |
+  | 动态/解耦装配 | `resolve_variable(use)` 反射 | Spring Bean + IoC |
+  | 执行路由 | LangGraph ToolNode | Spring AI 的 Tool 执行层 |
+
+- **一句话收束**：Spring AI 有完整对等能力，注册工具主流是 `@Tool` 注解（配 `@ToolParam`）再通过 `ChatClient.tools()` 挂上，也支持 `FunctionToolCallback` 编程式和 Spring Bean 式；**万变不离其宗——声明 + schema 自动生成 + 注册给模型 + 框架路由执行**，只是我们在 Python 用装饰器和反射，Spring AI 用注解和 IoC。
+
+🧠 **考察**：Agent 工具生态的横向视野、能否抽象出"工具调用"的框架无关本质。
+
+⚠ **常见错误 / 诚实边界**：
+- 不要把 Spring AI 的细节讲成本项目做过的——**本项目是 Python，没用 Spring AI**，答题要划清；
+- Spring AI 迭代较快，`@Tool`/`@ToolParam`/`ToolCallback` 等 API 名与用法**以你使用的具体版本官方文档为准**，面试中可坦诚"具体注解名以版本为准，但注册思路是这样"，比硬背 API 更稳。
+
+⭐⭐⭐⭐⭐ **加分**：能点出共同的底层范式——不管哪个框架，Tool Calling 本质都是「向模型暴露 JSON schema → 模型返回结构化调用 → 框架反射/路由到真实方法执行 → 结果回流」，语言和注册语法只是表层差异。
+
 ---
 
 ## 十、架构 Trade-off
@@ -911,3 +1071,43 @@ graph TB
 ---
 
 > 代码位置均以 `backend/packages/harness/deerflow/` 为根。建议面试前把 `tools/builtins/tool_search.py`（延迟工具核心）、`agents/middlewares/deferred_tool_filter_middleware.py`（双保险）、`tools/tools.py`（装配与安全）、`agents/thread_state.py:107`（merge_promoted）、`tools/sync.py`（同步桥接）通读一遍。相关文档见同目录 `DeerFlow-中间件链设计-深度讲解.md`、`DeerFlow-Agent核心模块讲解.md`。
+
+---
+
+## 十七、简历产出总结（可直接摘取）
+
+> 从全文提炼的、可写进简历的「项目产出」。提供四种粒度：一句话概述、分条产出、STAR 要点、技术关键词。均基于本仓库真实实现，无夸大。量化指标（token 降幅等）本仓库未提供，切勿虚构，如需请用真实数据。
+
+### 17.1 简历一句话版（放在项目标题下）
+
+> 设计并实现 AI Agent 运行时的**工具系统**：以「统一装配 + 延迟工具按需发现 + 可见/可执行解耦 + 安全默认」这套组合，在接入 20+ 社区 Provider 与任意 MCP 服务器（工具爆炸）场景下同时解决 token 成本失控、安全越权、多入口一致性问题。
+
+### 17.2 简历分条产出版（推荐，3-5 条，每条一个亮点）
+
+- **延迟工具按需发现（token 成本治理核心）**：设计 Deferred Tools 机制，模型初始只见工具名清单、不绑定 schema，通过 `tool_search`（支持精确 select / 关键词打分 / require 三种查询语法）按需检索才解锁调用，避免海量工具 schema 撑爆上下文，显著降低 token 成本。
+
+- **可见性与可执行性解耦（双保险）**：基于 LangGraph 中间件实现 schema 隐藏（`wrap_model_call` 剔除未提升工具）+ 执行拦截（`wrap_tool_call` 拦截未授权调用并引导先检索）双重防护，ToolNode 始终持有全部工具用于路由，杜绝"看不到却能越权调用"。
+
+- **提升状态机与目录漂移护栏**：将工具解锁状态（promoted）持久化到图状态而非全局变量，天然线程隔离、可回放；用 catalog_hash（工具目录内容 SHA-256）做版本护栏，目录变更时通过 reducer 整体替换旧记录，防止陈旧 checkpoint 暴露改名/换 schema 后的工具。
+
+- **统一装配与安全默认**：抽象统一装配入口 `get_available_tools` 供 lead/client/subagent 多路径复用，落地宿主 bash 默认禁用（fail-safe）、名称冲突去重（治理 #1803）、fail-closed 装配（延迟集恢复失败即拒绝绑定，宁失败不泄露）等安全默认。
+
+- **自动路由与同步/异步桥接**：实现关键词自动提升中间件（按用户输入提前解锁相关 MCP 工具，启动期断言保证其先于 schema 过滤执行）；用 `copy_context` + 独立线程池桥接同步 Agent 调用 async-only 工具，保 contextvar 不丢、不阻塞事件循环。
+
+### 17.3 简历 STAR 版（面试口述/自我介绍用）
+
+- **S（背景）**：AI Agent 靠工具与外部交互，我们接入 20+ 社区 Provider 与用户可任意挂载的 MCP 服务器，工具数量不可控。
+- **T（目标）**：在工具爆炸下让上下文 token 成本可控，同时保证安全不越权、多入口装配一致、同步异步兼容。
+- **A（行动）**：实现延迟工具 + tool_search 按需发现闭环；schema 隐藏 + 执行拦截双保险实现可见/可执行解耦；提升状态存图状态并用 catalog_hash 防漂移；统一装配入口做安全默认（宿主 bash 禁用、去重、fail-closed）；关键词自动提升 + 启动期顺序断言；copy_context + 线程池桥接 async 工具。
+- **R（结果）**：模型只为真正需要的工具付 schema token，工具爆炸下上下文可控；可见/可执行解耦保证不误暴露、不越权；一套装配被三条 Agent 路径复用，行为一致。
+
+### 17.4 技术关键词（供 ATS / 简历技能栏）
+
+LLM function calling、token 成本优化、状态机设计、LangGraph 图状态 + reducer、中间件顺序编排、内容哈希版本护栏、fail-safe/fail-closed 安全默认、命令注入防护、提示注入防护、反射装配、策略过滤、asyncio + contextvars、同步异步桥接、按名去重/幂等。
+
+### 17.5 使用建议
+
+- **应届/初级岗**：用 17.2 前 3 条（延迟工具、双保险解耦、状态护栏），突出成本意识与状态机设计；
+- **高级/资深岗**：加上后 2 条（统一装配安全默认、自动路由与同步桥接），突出工程深度与安全/并发经验；
+- **务必按真实参与度裁剪**，面试会按简历深挖（见第八、十六章追问树），只写自己能讲透的点；
+- **量化指标**（token 降幅、QPS 等）本仓库未提供，勿虚构，如需量化请用真实压测数据。
