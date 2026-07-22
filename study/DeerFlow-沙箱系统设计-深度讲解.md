@@ -22,12 +22,15 @@
 - [第 11 章 一页速查表](#第-11-章)
 - [第 12 章 模拟面试：你的沙箱是如何实现的](#第-12-章)
 - [第 13 章 大厂面试宝典：高频深度追问（SSP/SP）](#第-13-章)
+- [第 14 章 简历产出总结（可直接摘取）](#第-14-章)
 
 > **深入小节导航**（面向想深挖实现的读者）：
 > - 5.2.1 一条 bash 命令怎么被安全跑起来（shell 选择 / 管道 drain / 进程组终止）
 > - 6.3.1 热路径的性能优化（cached_property + 双套边界正则）
+> - 6.3.2 三个容易被忽略的实现细节（download_file 边界 / read_file 反向解析 / list_dir overlay）
 > - 6.8.1 懒加载的坑与 wrap_tool_call 状态持久化
 > - 8.3.1 LocalSandboxProvider 为什么这么设计（每线程沙箱 + LRU + 线程安全）
+> - 8.3.2 路径映射是怎么拼出来的（静态映射 + 每线程动态映射）
 
 ---
 
@@ -177,7 +180,7 @@ DeerFlow 沙箱用**两层抽象接口**把"能力"和"生命周期管理"分开
 
 ### 4.2 第二层：`SandboxProvider` —— 定义"沙箱怎么管理"
 
-[`SandboxProvider`](backend/packages/harness/deerflow/sandbox/sandbox_provider.py:10) 管的是沙箱的**生命周期**：
+[`SandboxProvider`](backend/packages/harness/deerflow/sandbox/sandbox_provider.py:9) 管的是沙箱的**生命周期**：
 
 | 方法 | 作用 |
 |------|------|
@@ -284,6 +287,8 @@ def _find_first_available_shell(candidates) -> str | None:
 ```
 
 **为什么要这么麻烦？** 因为模型生成的命令语法是按 bash 写的。如果落到 Windows 的 `cmd.exe` 上跑，语法完全不兼容。识别 shell 类型后，沙箱才能决定怎么正确地把命令交给它执行。
+
+> **实现细节（务必对照源码）**：`_get_shell()` 在 POSIX 上的探测顺序是 `("/bin/zsh", "/bin/bash", "/bin/sh", "sh")`——**首选是 `/bin/zsh`**（因为 macOS 默认 shell 已是 zsh），依次回退到 bash、sh，最后在 PATH 里找 `sh`。全都找不到时：Windows 上继续回退到 `pwsh`/`powershell`/`cmd.exe`，其余平台直接抛 `RuntimeError`。本文后面为讲解方便，示例里写的是 `/bin/bash`，真实首选请以源码的 zsh 为准。
 
 **环节二：把命令喂给 shell 并启动子进程**
 
@@ -530,6 +535,65 @@ def _content_pattern(self):
 用错边界会导致路径被"多吃"或"少吃"，翻译出错。这是一个"细节里藏魔鬼"的地方——两种上下文必须用各自贴合的正则。
 
 **要点三：按容器路径长度降序排序**（`key=lambda m: len(...), reverse=True`）。这保证**最长前缀优先匹配**：处理嵌套挂载时（如 `/mnt/skills` 和 `/mnt/skills-extra`），先匹配更长更具体的那个，不会错配。
+
+#### 6.3.2 深入：三个容易被忽略的实现细节（零遗漏补全）
+
+除了正向翻译和缓存，`local_sandbox.py` 里还有三处新手容易漏看、但很关键的实现，务必补齐认知。
+
+**细节一：`download_file` 的双重边界——白名单前缀 + 100MB 上限**
+
+下载二进制文件（比如把生成的 PDF 交付给用户）比读文本更敏感，所以 `download_file` 比 `read_file` 多了两道门：
+
+```python
+def download_file(self, path: str) -> bytes:
+    normalised = path.replace("\\", "/")
+    stripped_path = normalised.lstrip("/")
+    allowed_prefix = VIRTUAL_PATH_PREFIX.lstrip("/")
+    # ① 白名单校验：只允许下载 /mnt/user-data 前缀下的文件
+    if stripped_path != allowed_prefix and not stripped_path.startswith(f"{allowed_prefix}/"):
+        raise PermissionError(errno.EACCES, f"Access denied: path must be under '{VIRTUAL_PATH_PREFIX}'", path)
+    resolved_path = self._resolve_path(path)
+    max_download_size = 100 * 1024 * 1024   # ② 100MB 上限
+    file_size = os.path.getsize(resolved_path)
+    if file_size > max_download_size:
+        raise OSError(errno.EFBIG, ...)
+    ...
+```
+
+- **① 白名单前缀**：即便通过了路径翻译，下载还额外要求路径必须落在 `VIRTUAL_PATH_PREFIX`（即 `/mnt/user-data`）下——技能目录、acp-workspace 都不允许下载，进一步收窄了对外交付的出口；
+- **② 100MB 上限**：防止一次下载把内存撑爆（注意这与命令输出的 10MB 上限是两个不同的常量，别混淆）；
+- 源码里还专门标注了 **TOCTOU** 注记：`getsize()` 和 `read()` 之间文件可能变大，这是"受控沙箱环境下可接受的权衡"。
+
+**细节二：`read_file` 只对"Agent 自己写过的文件"做反向解析**
+
+反向翻译（真实路径 → 虚拟路径）并不是对所有读到的文件内容无脑执行的。`LocalSandbox` 用一个 `self._agent_written_paths` 集合记录"哪些文件是通过 `write_file` 写进去的"：
+
+```python
+def read_file(self, path):
+    ...
+    if resolved_path in self._agent_written_paths:      # 只有 Agent 自己写的才反向解析
+        content = self._reverse_resolve_paths_in_output(content)
+    return content
+```
+
+**为什么要区分？** 用户上传的文件、外部工具产生的文件，其内容里可能本来就含有类似真实路径的字符串（但那是数据的一部分，不是路径泄露）。如果对这些内容也无脑做反向替换，会**篡改用户数据**。所以只有 Agent 亲手 `write_file` 写进去的内容（可能含被正向翻译过的真实路径）才需要在读回时还原成虚拟路径。这也解释了第 8 章 LRU 淘汰时"丢失 `_agent_written_paths` 只是优雅降级"的含义——丢了它，`read_file` 退化成"不做反向解析"，等同于一次全新运行。
+
+**细节三：`list_dir` 的"虚拟子目录 overlay"补丁**
+
+`/mnt/skills` 下的 `public`/`custom`/`legacy` 这些子挂载，它们的真实目录往往在宿主机的**别处**（不在 `/mnt/skills` 对应的那一个物理目录里），底层的 `list_dir` 工具出于安全会跳过这些"目录外"的软链接式目标。结果就是：模型 `ls /mnt/skills` 时可能**看不到本该存在的技能子目录**。
+
+`LocalSandbox.list_dir` 因此加了一段"overlay"补丁：遍历所有 `path_mappings`，凡是"容器路径正好是当前请求目录的直接子级、且没被列出、且宿主目录真实存在"的挂载，手动把它补回结果列表：
+
+```python
+for mapping in self.path_mappings:
+    if mapping.container_path.startswith(container_path + "/"):
+        child_rel = mapping.container_path[len(container_path) + 1:]
+        if "/" not in child_rel and mapping.container_path.rstrip("/") not in existing_dirs:
+            if Path(mapping.local_path).resolve().is_dir():   # 确认宿主目录真实存在，不加幽灵项
+                result.append(f"{mapping.container_path}/")
+```
+
+这体现了一个思路：**当"安全遍历规则"和"契约要求模型能看到的视图"冲突时，用一层受控的 overlay 把契约要求的视图补回来**，而不是放松底层的安全规则。
 
 ### 6.4 `path_patterns.py`：反向翻译遮蔽（单一规则源）
 
@@ -792,6 +856,26 @@ _COMMAND_CAPTURE_LIMIT_BYTES = 10 * 1024 * 1024  # 输出上限 10MB
 **优雅降级到底"降"了什么？**
 
 被 LRU 淘汰的线程，下次 `acquire` 会重建一个全新的 `LocalSandbox`。重建代价极低，唯一"丢失"的是 `_agent_written_paths` 这个集合——它记录了"哪些文件是 Agent 自己写的"，只用于 `read_file` 时决定要不要对内容做反向路径解析。丢了它，`read_file` 就退化成"不做反向解析"，这恰好等同于一次全新运行的默认行为。所以**没有任何功能错误，只是少了一点点优化**。这就是"优雅降级"的精髓：极端情况下能力退一档，但绝不崩溃、不报错。
+
+#### 8.3.2 深入：路径映射是怎么"拼"出来的（静态 + 每线程动态）
+
+`LocalSandboxProvider` 给每个沙箱的 `path_mappings` 分成**两部分拼接**，这个划分本身就是安全与正确性的关键：
+
+**A. 静态映射（`_setup_path_mappings`，全进程共享、只算一次）**
+
+- **public 技能目录**：`/mnt/skills/public`，只读，所有线程共用；
+- **config.yaml 里的自定义挂载（`sandbox.mounts`）**：会经过三重校验后才加入——host_path 必须绝对、container_path 必须绝对、且**不能与保留前缀冲突**（`/mnt/skills/{public,custom,legacy}`、`/mnt/acp-workspace`、`/mnt/user-data`），冲突的直接跳过并告警；
+- **host_path 不存在时升级为 ERROR 日志（#3244）**：这里有个真实踩过的坑——`make up`（Docker 部署）时这段代码跑在 gateway 容器里，如果配置的 host 路径没同时 bind-mount 进容器，就会"静默地读到空目录"，极难排查。所以代码特意把它从"静默跳过"改成 **ERROR 级日志 + 可操作的修复指引**。
+
+**B. 每线程动态映射（`_build_thread_path_mappings`，依赖 thread_id + user_id）**
+
+为什么这些必须动态、不能塞进静态映射？因为它们的真实目录**因用户 / 会话而异**：
+
+- `/mnt/user-data`（聚合父目录）及其 `workspace`/`uploads`/`outputs` 三个子目录 + `/mnt/acp-workspace`——都解析到 `{base}/users/{user_id}/threads/{thread_id}/...`；
+- `/mnt/skills/custom`（**每用户**只读挂载）：早期版本曾在 init 时就绑定 `get_effective_user_id()`，导致"后续所有用户都解析到初始化那一刻那个用户的目录"这个严重 bug，所以必须每线程按真实 user_id 重新构建；
+- `/mnt/skills/legacy`（迁移前的全局 custom 技能）：**只对"还没有自己 per-user custom 技能"的用户挂载**，与列表层 `UserScopedSkillStorage` 的可见性规则保持一致——否则"列表层说看不到、但沙箱层能 `read_file` 读到"，两层对可见性产生分歧，而沙箱层是更宽松的那个（安全漏洞）。
+
+> **一个反复出现的设计原则**：只要涉及"用户能看到什么"，**列表/提示层与沙箱文件访问层必须给出一致的答案，且沙箱层不能比列表层更宽松**。custom、legacy 两处挂载的动态化都是为了守住这条线。
 
 ### 8.4 内存治理小结
 
@@ -1473,6 +1557,6 @@ Transformer 推理每个 token 算出 KV 向量存入 KV Cache，前缀相同则
 
 ---
 
-> **第 13 章小结**：本章覆盖并发（DCL / 非重入锁 / GIL）、操作系统（管道 / 进程组 / fork-exec）、安全（遍历防护 / 密钥擦除 / 防注入）、架构（两层抽象 / LangGraph 状态）、AI（前缀缓存 / 防注入）五大方向共 13 道 SSP/SP 标准题，每题含结论先行、底层原理、项目实践、方案对比、继续追问、面试表达模板，可作为沙箱专项面试冲刺清单。
+> **全文完**。本讲义严格基于本仓库 `backend/packages/harness/deerflow/sandbox/` 目录真实源码撰写，不虚构任何未实现的能力。建议对照源码反复研读第 6、8 章的核心实现。
 
 

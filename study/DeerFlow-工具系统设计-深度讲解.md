@@ -1111,3 +1111,855 @@ LLM function calling、token 成本优化、状态机设计、LangGraph 图状�
 - **高级/资深岗**：加上后 2 条（统一装配安全默认、自动路由与同步桥接），突出工程深度与安全/并发经验；
 - **务必按真实参与度裁剪**，面试会按简历深挖（见第八、十六章追问树），只写自己能讲透的点；
 - **量化指标**（token 降幅、QPS 等）本仓库未提供，勿虚构，如需量化请用真实压测数据。
+
+---
+
+# 第十八篇 · 零基础循循善诱式讲义（初学者从零看懂工具系统）
+
+> 前面十七章是「面试深度讲解」，节奏偏快、术语密集。这一篇换一种口吻：假设你**从没接触过 AI Agent、也没写过 LangChain**，我像带教导师一样，从「为什么要有这个东西」讲起，一步步带你把整个工具系统啃透。每一个类、每一个方法、每一处判空、每一个注解，我们都不跳过。
+> 建议边读边对照源码：`backend/packages/harness/deerflow/tools/`。
+
+---
+
+## 一、认知铺垫：我们为什么需要「工具系统」？
+
+### 1.1 先讲个生活场景
+
+想象你请了一位**超级聪明的助理**（这就是大模型 LLM）。他知识渊博、能写会算，但他有一个致命的局限：**他被关在一个只有纸笔的房间里，看不到外面的世界**。
+
+- 你问他「今天北京天气怎么样？」——他答不上来，因为他不能上网。
+- 你让他「把这段代码跑一下看看报什么错」——他做不到，因为他手里没有电脑。
+- 你说「把结果存成一个文件给我」——他也办不到，因为他碰不到你的硬盘。
+
+这位助理**只有大脑，没有手脚**。他能「想」，但不能「做」。
+
+### 1.2 痛点：光有大脑不够，还得有手脚
+
+于是我们要给这位助理配上「手脚」——这就是**工具（Tool）**：
+
+- 给他一个「搜索工具」，他就能上网查天气；
+- 给他一个「bash 工具」，他就能跑代码；
+- 给他一个「写文件工具」，他就能存结果。
+
+**工具就是 Agent（智能体）与外部世界交互的唯一手段。** 一个 Agent 干活的过程，本质上就是这么一个循环：
+
+```
+调大模型（想：我该干嘛）
+   ↓
+执行工具（做：真的去搜/去跑/去写）
+   ↓
+观察结果（看：拿到了什么）
+   ↓
+再调大模型（继续想：下一步干嘛）
+   ↓
+   ……（循环直到任务完成）
+```
+
+> 📌 **记住这个循环**，后面所有设计都是围绕它转的。
+
+### 1.3 新痛点：工具太多了，怎么办？
+
+好，现在我们给助理配了工具。但问题来了——工具**越来越多**：
+
+- 光「上网搜索」这一件事，就有 Tavily、Brave、Serper、Exa、DuckDuckGo、SearXNG 六七家服务商；
+- 「抓网页正文」又有 Jina、Crawl4AI、Firecrawl 等一大堆；
+- 更要命的是，用户还能**自己接入任意数量的 MCP 服务器**（MCP 你可以先理解为「第三方工具插件市场」），可能一下子冒出几十上百个工具。
+
+这里有个关键的技术事实你必须先建立：
+
+> **大模型每「认识」一个工具，都要先读一份该工具的『说明书』（叫 schema），而这份说明书是要占「上下文空间」的，占空间就要花钱（token 计费）。**
+
+打个比方：你给助理发一本《工具使用手册》，手册越厚，他读得越慢、你付的印刷费越贵，而且**手册太厚他反而找不到重点**（注意力被稀释）。
+
+当工具膨胀到几十上百个，把所有说明书一股脑塞给模型，可能占用**几万 token**——又贵、又慢、又让模型犯迷糊。**这就是「工具爆炸（Tool Explosion）」问题。**
+
+### 1.4 我们今天要做的事
+
+所以「工具系统」要解决的，其实是**四件事**（记住这四件事，就抓住了全局）：
+
+| # | 要解决的问题 | 大白话 |
+|---|------------|--------|
+| ① | **工具爆炸下的成本失控** | 工具太多，说明书太厚，又贵又让模型迷糊 |
+| ② | **装配的一致性与安全默认** | 多个地方都要用工具，不能各写一套；危险工具（如直接操作宿主机）默认要关掉 |
+| ③ | **同步/异步兼容** | 有些工具只会「异步」跑，但调用它的地方是「同步」的，不能卡死 |
+| ④ | **运行期按需暴露与授权** | 需要时才把工具说明书给模型；没解锁的工具不许乱调 |
+
+其中最核心、最亮眼的解法，叫 **延迟工具（Deferred Tools）**——先只告诉模型「有哪些工具（只给名字）」，等它真需要了再给「说明书」。这个我们后面重点讲。
+
+---
+
+## 二、宏观全景：先看森林，再看树木
+
+在钻进代码细节之前，我们先站高一点，看看整个系统长什么样。别急着背代码，先建立「地图感」。
+
+### 2.1 整个系统就三层
+
+你可以把工具系统想象成一家餐厅的运作：
+
+```
+第一层：装配层（后厨备菜）
+   get_available_tools()
+   → 决定「今天有哪些菜（工具）能做」
+   → 顺便：把不安全的菜撤掉、重名的菜去重、异步的菜配好同步的锅
+
+第二层：可见性层（服务员递菜单）
+   DeferredToolFilter + McpRouting
+   → 决定「给客人（模型）看菜单上的哪些菜」
+   → 招牌菜直接印在菜单上；小众菜先只写个名字，客人问了才给详细介绍
+
+第三层：执行层（真正炒菜）
+   ToolNode + wrap_tool_call
+   → 决定「客人点的菜，到底给不给做」
+   → 没「解锁」的菜，就算客人硬点，也先拦下来
+```
+
+一句话串起来：
+
+```
+装配层（有哪些工具） → 可见性层（模型看到哪些说明书） → 执行层（谁允许被真正执行）
+```
+
+### 2.2 核心角色介绍（剧组名单）
+
+| 角色（代码符号） | 扮演什么 | 通俗理解 |
+|-----------------|---------|---------|
+| [`get_available_tools()`](backend/packages/harness/deerflow/tools/tools.py:44) | 装配总管 | 后厨主厨，负责把今天能做的菜全部备齐 |
+| [`DeferredToolCatalog`](backend/packages/harness/deerflow/tools/builtins/tool_search.py:63) | 延迟工具目录 | 一本「小众菜清单」，只记菜名，可被检索 |
+| [`tool_search`](backend/packages/harness/deerflow/tools/builtins/tool_search.py:139) 工具 | 检索员 | 客人说「我想找会做辣的菜」，它帮忙翻清单找出来 |
+| [`DeferredToolFilterMiddleware`](backend/packages/harness/deerflow/agents/middlewares/deferred_tool_filter_middleware.py:28) | 菜单过滤器 | 决定菜单上印哪些菜、拦住没解锁的点单 |
+| [`McpRoutingMiddleware`](backend/packages/harness/deerflow/agents/middlewares/mcp_routing_middleware.py:27) | 自动推荐员 | 客人一提「想吃辣」，主动把辣菜先摆上菜单 |
+| [`merge_promoted()`](backend/packages/harness/deerflow/agents/thread_state.py:110) | 状态管家 | 记录「哪些菜已经解锁了」，还防止用错旧记录 |
+| [`make_sync_tool_wrapper()`](backend/packages/harness/deerflow/tools/sync.py:36) | 同步/异步翻译官 | 让「只会异步做的菜」也能在同步厨房里做出来 |
+
+### 2.3 整体流程图（先混个眼熟）
+
+```mermaid
+graph TB
+    A[配置文件 config.tools] --> B[装配层 get_available_tools]
+    B --> C[剔除宿主 bash 安全默认]
+    B --> D[异步工具挂同步壳]
+    B --> E[按名去重]
+    B --> F[MCP 工具打标签]
+    F --> G[assemble_deferred_tools 分离延迟集]
+    G --> H[可见性层 过滤菜单]
+    H --> I[执行层 ToolNode 真正炒菜]
+```
+
+> 现在看不懂没关系，我们下一章逐个模块把它拆开。这张图你先记住「三层」就够了。
+
+---
+
+## 三、逐模块深入剖析（核心重点，逐行带你读）
+
+### 3.1 装配层：`get_available_tools()` —— 后厨主厨备菜
+
+**它在哪？** [`tools.py:44`](backend/packages/harness/deerflow/tools/tools.py:44)
+
+**它的职责是什么？** 一句话：**把「今天这个 Agent 能用的所有工具」备齐、清洗、去重，交出一份干净的清单。** 它是整个系统唯一的「工具装配入口」，lead agent（主智能体）、embedded client（嵌入式客户端）、subagent（子智能体）三条路径都调它——**统一一个入口，行为才一致**。
+
+我们跟着代码从头走一遍，一步都不跳。
+
+#### 第 1 步：从配置里挑出要用的工具
+
+```python
+config = app_config or get_app_config()
+tool_configs = [tool for tool in config.tools if groups is None or tool.group in groups]
+```
+
+- `config.tools` 是配置文件（`config.yaml`）里声明的所有工具；
+- `groups` 是个可选的「分组过滤器」——如果传了分组，就只留属于这些组的工具；没传（`None`）就全要。
+
+> 💡 **为什么这么写？** 不同 Agent 可能只需要一部分工具（比如某个 Agent 只做搜索、不碰 bash），用 `groups` 一过滤就能定制。这是「按需装配」的第一道闸。
+
+#### 第 2 步（安全默认）：把「宿主 bash」踢出去
+
+```python
+if not is_host_bash_allowed(config):
+    tool_configs = [tool for tool in tool_configs if not _is_host_bash_tool(tool)]
+```
+
+这一步**极其重要**，是安全红线。我们先理解「宿主 bash」是什么：
+
+- 「bash」就是能执行系统命令的工具（`ls`、`rm`、`cat` 都能跑）；
+- 「**宿主** bash」= 直接在**你自己这台真机器**上跑命令，没有任何隔离。
+
+想象你把「能在你电脑上执行任意命令」的权力，交给了一个 AI——它一旦被诱导，可能 `rm -rf` 删你的文件。**这太危险了。**
+
+所以设计原则是 **fail-safe（默认最安全）**：只要当前不是用 Docker 沙箱隔离（`is_host_bash_allowed` 返回假），就在装配阶段**直接把宿主 bash 工具剔除**。想用 shell？请显式配置 Docker 沙箱，让命令在隔离容器里跑。
+
+再看它怎么识别「宿主 bash」——[`_is_host_bash_tool()`](backend/packages/harness/deerflow/tools/tools.py:26)：
+
+```python
+def _is_host_bash_tool(tool: object) -> bool:
+    group = getattr(tool, "group", None)
+    use = getattr(tool, "use", None)
+    if group == "bash":
+        return True
+    if use == "deerflow.sandbox.tools:bash_tool":
+        return True
+    return False
+```
+
+> 💡 **为什么要两种匹配（group 和 use 各判一次）？** 因为一个工具可能通过「分组名叫 bash」被识别，也可能通过「实现指向 `bash_tool`」被识别。**两条路都堵上，防止有人换个分组名就绕过安全检查。** 这叫「防绕过」。
+>
+> 💡 **为什么用 `getattr(tool, "group", None)` 而不是直接 `tool.group`？** 因为不确定每个 tool 对象都有 `group` 属性，直接点可能抛 `AttributeError`。用 `getattr` 加默认值 `None`，**取不到就当没有，绝不报错**——这是防御式编程。
+
+#### 第 3 步：把配置「反射」成真正的工具对象
+
+```python
+loaded_tools_raw = [(cfg, resolve_variable(cfg.use, BaseTool)) for cfg in tool_configs]
+```
+
+配置里每个工具写的是一个字符串，比如 `use: deerflow.community.tavily.tools:web_search_tool`。`resolve_variable` 就是「**按这个字符串，动态地把对应的工具对象加载进来**」——这叫**反射装配**。
+
+> 💡 **为什么用反射？** 这样新增一个工具，只要「写一个工具函数 + 在配置里加一行 `use`」就行，**装配代码一个字都不用改**。可插拔、易扩展。
+
+#### 第 4 步（治 bug）：名字对不上就告警
+
+```python
+for cfg, loaded in loaded_tools_raw:
+    if cfg.name != loaded.name:
+        logger.warning("Tool name mismatch: ...")
+```
+
+- `cfg.name` 是配置里写的名字；
+- `loaded.name` 是工具对象**自己**的名字。
+
+这俩要是不一致会出大事：**模型在说明书里看到的是 A 名字，运行时却按 B 名字识别**，结果模型调 A，系统说「没有 A 这个工具」——这正是真实 bug **issue #1803** 的根因。
+
+这里的处理是：不一致就打警告日志，并且**统一用工具对象自己的 `.name`** 去绑定（以工具自己为准）。
+
+#### 第 5 步：给「只会异步」的工具配一口「同步锅」
+
+```python
+loaded_tools = [_ensure_sync_invocable_tool(t) for _, t in loaded_tools_raw]
+```
+
+这个先记住「有这一步」，具体原理我们放到 **3.4 同步桥接** 详讲。简单说：有些工具只有异步实现，但调用方是同步的，这里给它挂个「同步外壳」。
+
+#### 第 6 步：按条件追加「内置工具」
+
+```python
+builtin_tools = BUILTIN_TOOLS.copy()
+```
+
+先看 [`BUILTIN_TOOLS`](backend/packages/harness/deerflow/tools/tools.py:15)（永远都有的基础工具）：
+
+```python
+BUILTIN_TOOLS = [
+    present_file_tool,      # 把文件"呈现"给用户
+    ask_clarification_tool, # 向用户追问澄清
+    review_skill_package,   # 审查技能包
+]
+```
+
+> 💡 **为什么先 `.copy()`？** 因为 `BUILTIN_TOOLS` 是个模块级的**共享列表**。如果直接往它身上 `append`，会**污染全局**——下次别人调用 `get_available_tools` 时，列表里就多了上次追加的东西。`.copy()` 复制一份出来改，**互不干扰**。这是新手极易踩的坑！
+
+然后按条件往这份副本里加东西：
+
+```python
+# ① 技能进化开启 → 加 skill_manage_tool
+if getattr(skill_evolution_config, "enabled", False):
+    from deerflow.tools.skill_manage_tool import skill_manage_tool
+    builtin_tools.append(skill_manage_tool)
+
+# ② 子智能体开启 → 加 task 工具
+if subagent_enabled:
+    builtin_tools.extend(SUBAGENT_TOOLS)
+
+# ③ 模型支持看图 → 加 view_image_tool
+if model_config is not None and model_config.supports_vision:
+    builtin_tools.append(view_image_tool)
+```
+
+> 💡 **为什么用「懒加载」（在 if 里面才 `import`）？** 只有真正需要 `skill_manage_tool` 时才导入它，**避免不必要的模块加载开销和可能的循环依赖**。
+>
+> 💡 **为什么看图工具要判 `supports_vision`？** 给一个不支持图像的模型塞「看图工具」毫无意义，只会白占说明书空间。**按模型能力裁剪工具**，很讲究。
+
+#### 第 7 步：取 MCP 工具（从缓存，不现拉）
+
+```python
+if include_mcp:
+    try:
+        extensions_config = ExtensionsConfig.from_file()
+        if extensions_config.get_enabled_mcp_servers():
+            mcp_tools = get_cached_mcp_tools()
+            for t in mcp_tools:
+                tag_mcp_tool(t)   # ← 关键：打标签
+    except ImportError:
+        logger.warning("MCP module not available...")
+    except Exception as e:
+        logger.error(f"Failed to get cached MCP tools: {e}")
+```
+
+这里有几个关键点，逐个说：
+
+1. **为什么读 `ExtensionsConfig.from_file()` 而不是 `config.extensions`？** 注释说得很清楚：MCP 配置可能被另一个进程（Gateway API）在运行时改动，**从磁盘重新读一次，才能拿到最新配置**。
+2. **为什么是 `get_cached_mcp_tools()`（读缓存）而不是现场去拉？** MCP 工具在应用启动时就初始化好并缓存了。**装配期读缓存，快且不阻塞**——你总不能每次备菜都重新联系一遍所有供应商吧？
+3. **`tag_mcp_tool(t)` 打的什么标签？为什么重要？** 这是**整个延迟工具机制的引信**！后面「哪些工具要延迟」就靠这个标签判断。我们看它的实现——[`mcp_metadata.py:26`](backend/packages/harness/deerflow/tools/mcp_metadata.py:26)：
+
+```python
+MCP_TOOL_METADATA_KEY = "deerflow_mcp"
+
+def tag_mcp_tool(tool: BaseTool) -> BaseTool:
+    tool.metadata = {**(tool.metadata or {}), MCP_TOOL_METADATA_KEY: True}
+    return tool
+
+def is_mcp_tool(tool: BaseTool) -> bool:
+    return (getattr(tool, "metadata", None) or {}).get(MCP_TOOL_METADATA_KEY) is True
+```
+
+> 💡 **为什么把「打标签/读标签」和那个魔法字符串 `"deerflow_mcp"` 单独放一个文件？** 这叫「**单一真源（Single Source of Truth）**」。这个魔法字符串只存在**一处**，写标签的人和读标签的人都 import 同一个函数。假如以后要改标签名，只改这一个文件，不会漏。
+>
+> 💡 **注意 `{**(tool.metadata or {}), KEY: True}` 这个写法**：`tool.metadata or {}` 是防止 metadata 是 `None`（判空！），`{**旧的, 新的}` 是「保留原有 metadata、再加一个键」，**不覆盖原有信息**。
+
+4. **为什么用 try/except 包起来，还分 ImportError 和 Exception？** 因为 MCP 是可选功能——没装依赖包（ImportError）或者拉取失败（其他 Exception），**不能让整个装配崩掉**，打个日志、`mcp_tools` 保持空列表，继续往下走。这叫「优雅降级」。
+
+#### 第 8 步：追加 ACP 工具（跨 Agent 协议）
+
+```python
+acp_tools: list[BaseTool] = []
+try:
+    ...
+    if acp_agents:
+        acp_tools.append(build_invoke_acp_agent_tool(acp_agents))
+except Exception as e:
+    logger.warning(f"Failed to load ACP tool: {e}")
+```
+
+ACP 你先理解为「让这个 Agent 能去调用**别的** Agent」的工具。同样用 try/except 保护，失败也不影响主流程。
+
+#### 第 9 步（重头戏）：合并 + 按名去重
+
+```python
+all_tools = [_ensure_sync_invocable_tool(t) for t in loaded_tools + builtin_tools + mcp_tools + acp_tools]
+seen_names: set[str] = set()
+unique_tools: list[BaseTool] = []
+for t in all_tools:
+    if t.name not in seen_names:
+        unique_tools.append(t)
+        seen_names.add(t.name)
+    else:
+        logger.warning("Duplicate tool name %r detected and skipped ...")
+return unique_tools
+```
+
+逐句看：
+
+- **合并顺序 `loaded_tools + builtin_tools + mcp_tools + acp_tools`** 就是**优先级**：配置工具 > 内置 > MCP > ACP。因为去重时「先出现的赢」，所以排在前面的优先保留。
+- **`seen_names` 用 `set`（集合）** 记录「已经见过的名字」。为什么用 set？因为 `in` 判断在集合里是 O(1)，**查得飞快**；如果用 list，每次判断都要遍历，慢。
+- **遇到重名就跳过并告警**：如果不去重，模型会收到「两份同名但内容不同的说明书」，直接懵掉（又是 issue #1803 的表现）。
+
+> 🎯 **这一段的核心思想**：**同名工具只能有一个**，否则模型会歧义。去重 + 告警，既保证正确，又留下排查线索。
+
+---
+
+### 3.2 可见性层：延迟工具「三件套」—— 系统最精华的部分
+
+装配层备好了所有菜。但如果菜太多（MCP 工具可能几十上百个），全印在菜单上给客人看，客人就晕了、菜单印刷费也爆了。**延迟工具**就是来解决这个的。
+
+先把「延迟工具」这四个字讲透：
+
+> **延迟工具 = 一开始只给模型「工具名字」，不给「说明书（schema）」。模型知道「有这么个工具存在」，但拿不到调用参数，所以暂时「看得见、调不了」。等它真需要，通过 `tool_search` 检索，才拿到完整说明书并「解锁」。**
+
+这套机制由**三个组件**协作完成，我们一个个拆。
+
+#### 组件一：`DeferredToolCatalog` —— 一本可搜索的「小众菜清单」
+
+**它在哪？** [`tool_search.py:63`](backend/packages/harness/deerflow/tools/builtins/tool_search.py:63)
+
+```python
+@dataclass(frozen=True)
+class DeferredToolCatalog:
+    """Immutable catalog of deferred tools. Pure search, no mutation."""
+    tools: tuple[BaseTool, ...]
+
+    @cached_property
+    def names(self) -> frozenset[str]:
+        return frozenset(t.name for t in self.tools)
+
+    @cached_property
+    def hash(self) -> str:
+        canon = [{"name": t.name, "schema": convert_to_openai_function(t)} for t in sorted(self.tools, key=lambda t: t.name)]
+        blob = json.dumps(canon, sort_keys=True, ensure_ascii=False, default=str)
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+```
+
+我们逐个细节抠：
+
+**① `@dataclass(frozen=True)` 是什么？** `dataclass` 是 Python 帮你自动生成构造函数等的语法糖；`frozen=True` 表示「**冻结、不可变**」——创建后不能再改它的字段。
+
+> 💡 **为什么要不可变？** 这本「清单」在整个 run 期间被反复读取（模型每轮都可能来搜）。不可变对象**天然线程安全、可以放心共享、不怕被谁悄悄改了**。这是函数式编程的经典思路。
+
+**② `tools: tuple[...]` 为什么用 tuple 不用 list？** 因为 tuple 是不可变的，list 是可变的。既然整个类都要 frozen，装工具的容器也得是不可变的 tuple，**首尾呼应**。
+
+**③ `@cached_property` 是什么？** 「带缓存的属性」——第一次访问 `catalog.names` 时计算一次并存起来，之后再访问直接返回缓存，**不重复计算**。
+
+> 💡 **为什么 `names` 和 `hash` 要缓存？** 因为算 hash 要遍历所有工具、序列化、跑 SHA-256，**不便宜**。模型每轮都可能用到，缓存一次省很多。
+
+**④ 全场最坑的一个注释——为什么 frozen 却「故意不加 slots」？** 看源码上方注释：
+
+```python
+# NOTE: frozen=True without slots=True keeps __dict__, which is what lets the
+# @cached_property fields below cache ... Do NOT add slots=True or hash/names break at runtime.
+```
+
+大白话：`cached_property` 需要往对象的 `__dict__`（属性字典）里写缓存值。而 `frozen=True` 本来禁止改属性——`cached_property` 是靠**直接写 `__dict__` 绕过**这个限制的。如果再加 `slots=True`，对象就**没有 `__dict__` 了**，缓存无处可写，**运行时直接炸**。
+
+> 🎯 **这就是「注释即契约」**：这行注释是在告诉未来的维护者「别手贱加 slots，会出事」。新手看到 frozen dataclass 常想「加个 slots 优化内存」，这里偏偏不能加。
+
+**⑤ `hash` 为什么这么算？** 它把每个工具的「名字 + 说明书」按名字排序后，序列化成 JSON，再求 SHA-256 取前 16 位。
+
+- `sort_keys=True` + `sorted(...)`：**排序保证同样的内容永远算出同样的 hash**（顺序不影响结果）；
+- 这个 hash 代表「**当前这批延迟工具的内容指纹**」——只要工具集变了（增删、改名、改说明书），hash 就变。
+
+> 💡 **这个 hash 有什么用？** 记住它叫 `catalog_hash`，后面「防止用错旧记录」全靠它。先埋个伏笔。
+
+**⑥ 核心方法 `search()` —— 怎么根据查询找工具？** [`tool_search.py:76`](backend/packages/harness/deerflow/tools/builtins/tool_search.py:76)
+
+```python
+def search(self, query: str) -> list[BaseTool]:
+    query = query.strip()
+    if not query:
+        return []
+
+    if query.startswith("select:"):
+        wanted = {n.strip() for n in query[7:].split(",")}
+        return [t for t in self.tools if t.name in wanted]
+
+    if query.startswith("+"):
+        parts = query[1:].split(None, 1)
+        if not parts:
+            return []
+        required = parts[0].lower()
+        candidates = [t for t in self.tools if required in t.name.lower()]
+        if len(parts) > 1:
+            candidates.sort(key=lambda t: _catalog_regex_score(parts[1], t), reverse=True)
+        return candidates[:MAX_RESULTS]
+
+    regex = _compile_catalog_regex(query)
+    scored: list[tuple[int, BaseTool]] = []
+    for t in self.tools:
+        searchable = f"{t.name} {t.description or ''}"
+        if regex.search(searchable):
+            scored.append((2 if regex.search(t.name) else 1, t))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [t for _, t in scored][:MAX_RESULTS]
+```
+
+它支持**三种查询语法**，对应模型三种意图，我们一种种看：
+
+- **`query.strip()` 先去空格，空查询直接返回空**——防御式，模型给个空字符串不至于崩。
+
+- **语法一：`select:Read,Edit`（精确点名）**
+  - 模型已经知道确切名字，逗号分隔。
+  - `query[7:]` 是砍掉前面 `"select:"` 这 7 个字符，取后面的内容。
+  - **注意：这种模式不做数量截断！** 为什么？注释说了：模型是**明确点名**要这几个，你截断了就等于**悄悄丢掉它要的工具**，会出错。
+
+- **语法二：`+slack send`（require 硬性要求 + 排序）**
+  - `+` 后第一个词（`slack`）是**硬性要求**：工具名必须包含它；
+  - 剩下的（`send`）用来在候选里排序。
+  - `parts = query[1:].split(None, 1)`：`split(None, 1)` 表示「按空白分割，最多分 1 次」，所以 `parts` 最多两段。
+  - `if not parts: return []`：处理「光一个 `+` 没跟内容」的边界——没要求就啥也返回不了。
+  - 结果截断在 `MAX_RESULTS`（=5）。
+
+- **语法三：`notebook jupyter`（默认关键词模糊搜索）**
+  - 把查询当**正则**在「名字 + 描述」里搜。
+  - **打分规则**：命中**名字**权重 **2**，只命中**描述**权重 **1**。为什么名字权重高？因为名字比描述更能代表工具身份，名字命中说明更相关。
+  - 降序排序后取前 5（`MAX_RESULTS`）。
+
+**⑦ 一个关键的健壮性设计：非法正则怎么办？** 看 [`_compile_catalog_regex()`](backend/packages/harness/deerflow/tools/builtins/tool_search.py:45)：
+
+```python
+def _compile_catalog_regex(pattern: str) -> re.Pattern[str]:
+    try:
+        return re.compile(pattern, re.IGNORECASE)
+    except re.error:
+        return re.compile(re.escape(pattern), re.IGNORECASE)
+```
+
+> 💡 **为什么要 try/except？** 查询是**模型生成的**，模型可能给出一个非法正则（比如括号不配对 `(abc`）。如果直接 `re.compile` 会抛异常让工具崩溃。这里捕获 `re.error`，**降级成把它当普通字符串（`re.escape`）来匹配**——绝不崩溃。
+>
+> 🎯 **这是「信任边界」思维**：凡是来自模型/外部的输入，都是**不可信**的，必须做好「它给我垃圾我也不崩」的准备。
+
+#### 组件二：`tool_search` 工具 —— 那个「检索员」
+
+**它在哪？** 由 [`build_tool_search_tool()`](backend/packages/harness/deerflow/tools/builtins/tool_search.py:139) 用**闭包**方式生成：
+
+```python
+def build_tool_search_tool(catalog: DeferredToolCatalog) -> BaseTool:
+    catalog_hash = catalog.hash   # ← 闭包捕获
+
+    @tool
+    def tool_search(query: str, tool_call_id: Annotated[str, InjectedToolCallId]) -> Command:
+        """Fetches full schema definitions for deferred tools ..."""
+        matched = catalog.search(query)
+        if not matched:
+            content, names = f"No tools found matching: {query}", []
+        else:
+            content = json.dumps([convert_to_openai_function(t) for t in matched], indent=2, ensure_ascii=False)
+            names = [t.name for t in matched]
+        return Command(
+            update={
+                "promoted": {"catalog_hash": catalog_hash, "names": names},
+                "messages": [ToolMessage(content=content, tool_call_id=tool_call_id, name="tool_search")],
+            }
+        )
+    return tool_search
+```
+
+逐点拆：
+
+**① 什么叫「闭包」？为什么用它？** 闭包就是「一个函数记住了它被创建时的外部变量」。这里 `tool_search` 这个内部函数**记住了外层的 `catalog_hash`**。
+
+> 💡 **为什么要记住 catalog_hash？** 这样每次 `tool_search` 解锁工具时，都能带上「当前工具目录的指纹」。将来目录变了，旧指纹就对不上——伏笔又埋深了一层。
+
+**② `@tool` 装饰器是什么？** 这是 LangChain 提供的，把一个普通 Python 函数**变成大模型能调用的工具**。函数的类型注解（`query: str`）生成参数说明，docstring（那段三引号注释）生成工具描述。
+
+> 🎯 **重点：docstring 就是给模型看的「工具说明书」！** 你看那段 docstring 里写清了三种查询语法（`select:` / 关键词 / `+`）——模型正是读这段才知道怎么用 `tool_search`。**写 docstring ≈ 写 prompt**，不是可有可无的注释。
+
+**③ `tool_call_id: Annotated[str, InjectedToolCallId]` 是什么鬼？** 这是 LangChain 的「**注入参数**」——`InjectedToolCallId` 告诉框架「这个参数不用模型填，框架自动注入本次调用的 ID」。模型只需要填 `query`，`tool_call_id` 是系统塞进来的。
+
+> 💡 **为什么需要这个 ID？** 因为返回结果时要生成一条 `ToolMessage`，这条消息必须标注「我是回应哪次调用的」，靠的就是这个 ID 配对。
+
+**④ 返回的 `Command(...)` 是什么？为什么不直接 return 文本？** 这是全场又一个精妙点。`Command` 能**一次同时干两件事**：
+
+```python
+return Command(update={
+    "promoted": {...},              # 事情A：把命中工具写进"已解锁"状态
+    "messages": [ToolMessage(...)], # 事情B：把工具说明书作为消息回给模型
+})
+```
+
+- `promoted` 更新的是**图状态**（后面 3.3 详讲），等于「登记：这几个工具解锁了」；
+- `messages` 里塞的是命中工具的完整说明书（`convert_to_openai_function` 把工具转成 OpenAI function schema）。
+
+> 🎯 **一步完成「发现 + 授权」**：模型调一次 `tool_search`，既拿到了说明书（能看懂怎么调），又完成了解锁登记（被允许调）。用普通 return 只能返回文本，做不到「同时改状态」，所以必须用 `Command`。
+
+**⑤ 没命中的处理**：`content = "No tools found matching: {query}"`，`names = []`。空列表意味着「没解锁任何工具」，如实告诉模型「没找到」。
+
+#### 组件三：`DeferredToolFilterMiddleware` —— 菜单过滤器 + 点单门禁
+
+**它在哪？** [`deferred_tool_filter_middleware.py:28`](backend/packages/harness/deerflow/agents/middlewares/deferred_tool_filter_middleware.py:28)
+
+这是「延迟工具能落地」的关键。它做**两件事，两道防线**：
+
+**防线一：`wrap_model_call` —— 藏说明书（省 token）**
+
+先看它怎么算「哪些该藏」：
+
+```python
+def _promoted(self, state) -> set[str]:
+    promoted = (state or {}).get("promoted")
+    if promoted and promoted.get("catalog_hash") == self._catalog_hash:
+        return set(promoted.get("names") or [])
+    return set()
+
+def _hidden(self, state) -> set[str]:
+    return set(self._deferred) - self._promoted(state)
+```
+
+- `_deferred`：**所有**延迟工具的名字（构造时传入）；
+- `_promoted`：**已解锁**的工具名字（从图状态读）；
+- `_hidden = 全部延迟 - 已解锁` —— **剩下的就是「还该藏着」的**。
+
+> 💡 **`_promoted` 里那个 `catalog_hash` 判断在干嘛？** `promoted.get("catalog_hash") == self._catalog_hash`——**只认「指纹对得上」的解锁记录**。如果图状态里存的是旧目录的解锁记录（指纹不匹配），一律当作「没解锁」。这就是前面埋的伏笔兑现——**防止旧记录解锁了错误的工具**。
+>
+> 💡 **`(state or {}).get("promoted")` 和 `promoted.get("names") or []`**：全是判空。state 可能是 None，promoted 可能没有 names 键——层层兜底，绝不因为「少了个字段」就崩。
+
+然后过滤：
+
+```python
+def _filter_tools(self, request: ModelRequest) -> ModelRequest:
+    if not self._deferred:
+        return request
+    hide = self._hidden(request.state)
+    if not hide:
+        return request
+    active = [t for t in request.tools if getattr(t, "name", None) not in hide]
+    return request.override(tools=active)
+```
+
+- 没有延迟工具（`not self._deferred`）→ 啥都不干，原样返回（**性能短路**，不做无用功）；
+- 没有要藏的（`not hide`）→ 也原样返回；
+- 否则：从 `request.tools` 里**剔除掉要藏的**，`request.override(tools=active)` 生成一个「只含可见工具」的新请求给模型。
+
+> 🎯 **这一步的效果**：模型收到的说明书里，**根本没有未解锁工具的 schema**——它压根看不到，自然省 token。
+
+**防线二：`wrap_tool_call` —— 拦点单（防越权）**
+
+```python
+def _blocked_tool_message(self, request: ToolCallRequest) -> ToolMessage | None:
+    if not self._deferred:
+        return None
+    name = str(request.tool_call.get("name") or "")
+    if not name or name not in self._hidden(request.state):
+        return None
+    tool_call_id = str(request.tool_call.get("id") or "missing_tool_call_id")
+    return ToolMessage(
+        content=(f"Error: Tool '{name}' is deferred and has not been promoted yet. Call tool_search first ..."),
+        tool_call_id=tool_call_id, name=name, status="error",
+    )
+```
+
+> 💡 **等等，模型都看不到说明书了，为什么还要拦？** 好问题！因为**模型可能从历史对话里「学」到某个工具名**，然后硬凑一个调用。所以光藏说明书不够，执行前还要再查一道：**被调的工具如果还在 `_hidden` 里（没解锁），就拦下来**，返回一条 `status="error"` 的消息，**引导它「先去 tool_search」**。
+
+> 🎯 **这就是「可见性」和「可执行性」的解耦**：
+> - 藏说明书（可见性）省 token；
+> - 拦执行（可执行性）防越权。
+> - 而**工具本体始终在 ToolNode 里**（用于执行路由），只是说明书对模型隐藏。三者由同一份 `promoted` 状态驱动，保持一致。
+
+**为什么每个钩子都有同步 + 异步两个版本？**（`wrap_model_call` / `awrap_model_call` 等）因为 Agent 可能跑在同步路径，也可能跑在异步路径，两套都要支持，逻辑一样只是一个带 `async`。
+
+#### 组件四（辅助）：`McpRoutingMiddleware` —— 自动推荐员
+
+**它在哪？** [`mcp_routing_middleware.py:27`](backend/packages/harness/deerflow/agents/middlewares/mcp_routing_middleware.py:27)
+
+前面的流程是「模型自己主动 `tool_search`」。但有时候模型**没意识到**某个工具能帮上忙。于是加了这个「自动推荐」——**用户一提到某些关键词，就提前把相关工具解锁**。
+
+核心方法 `_matched_names`：
+
+```python
+def _matched_names(self, state) -> list[str]:
+    if not self._catalog_hash or not self._routing_index:
+        return []
+    messages = list((state or {}).get("messages") or [])
+    target = self._latest_user_message(messages)
+    if target is None:
+        return []
+    text = get_original_user_content_text(target.content, target.additional_kwargs)
+    if not text:
+        return []
+    haystack = text.casefold()
+    matched: list[tuple[int, str]] = []
+    for name, (priority, keywords) in self._routing_index.items():
+        if any(keyword.casefold() in haystack for keyword in keywords):
+            matched.append((priority, name))
+    matched.sort(key=lambda item: (-item[0], item[1]))
+    return [name for _, name in matched[: self._top_k]]
+```
+
+逐点：
+
+- **`_latest_user_message`：只取「最近一条真实用户消息」**。看 [`mcp_routing_middleware.py:71`](backend/packages/harness/deerflow/agents/middlewares/mcp_routing_middleware.py:71) 它从后往前找、用 `is_real_user_message` 过滤掉工具消息/系统消息。
+  > 💡 **为什么只看最近真实用户消息？** 如果拿所有消息匹配，会被历史消息、工具返回结果**污染**——用户十轮前提过「slack」，不代表现在还要用。只看最新用户意图，最准。
+- **`casefold()`：大小写归一化**。比 `lower()` 更彻底（能处理某些特殊字符），保证「Slack」「SLACK」「slack」都能匹配。
+- **`any(keyword in haystack)`：子串匹配**。用户消息里只要包含关键词，就算命中。
+- **排序 `(-item[0], item[1])`：先按 priority 降序，再按名字升序**，取前 `top_k` 个。
+
+**这个中间件挂在 `before_model` 钩子**（模型调用**之前**执行）：
+
+```python
+def before_model(self, state, runtime) -> dict[str, Any] | None:
+    return self._state_update(state)
+```
+
+匹配到就返回 `{"promoted": {...}}` 写状态，等于**替模型提前解锁了工具**。
+
+> 🎯 **一个极重要的设计约束——它必须先于过滤器跑！**
+> 想想看：`McpRoutingMiddleware` 负责「提前解锁」，`DeferredToolFilterMiddleware` 负责「藏未解锁的」。如果**过滤器先跑**，这轮的解锁还没写进状态，说明书就已经被藏掉了，自动推荐白做！
+>
+> 所以有个启动期断言 [`assert_mcp_routing_before_deferred_filter()`](backend/packages/harness/deerflow/agents/middlewares/mcp_routing_middleware.py:130)：装配中间件时检查顺序，**装反了直接抛错**，让问题在启动期就暴露，而不是等到线上出诡异 bug。
+
+> 💡 **注意这个中间件的「职责单一」**：它只收一份「扁平的、可序列化的路由表（routing_index）」，**不持有工具对象、不执行工具、不过滤**。过滤仍归 `DeferredToolFilterMiddleware`。**各管一摊，互不耦合。**
+
+#### 把三件套 + 装配串起来：`assemble_deferred_tools`
+
+**它在哪？** [`tool_search.py:187`](backend/packages/harness/deerflow/tools/builtins/tool_search.py:187)
+
+```python
+def assemble_deferred_tools(candidate_tools, *, enabled):
+    deferred_setup = build_deferred_tool_setup(candidate_tools, enabled=enabled)
+    if enabled and not deferred_setup.deferred_names and any(is_mcp_tool(t) for t in candidate_tools):
+        raise RuntimeError("tool_search enabled and MCP candidates exist, but no deferred set was recovered - refusing to bind MCP schemas (fail-closed).")
+    final_tools = list(candidate_tools)
+    if deferred_setup.tool_search_tool:
+        final_tools.append(deferred_setup.tool_search_tool)
+    return final_tools, deferred_setup
+```
+
+> 🎯 **这里有个「宁可失败也不泄露」的安全设计（fail-closed）**：如果「延迟功能开着」+「确实有 MCP 工具」，却「没能恢复出延迟集」——**直接抛错拒绝继续**，而不是稀里糊涂把所有 MCP 说明书全暴露给模型。
+>
+> **为什么这么刚？** 因为「静默暴露」是安全事故（几十上百个 MCP 工具说明书全塞给模型，token 爆炸 + 可能暴露不该暴露的工具）。**出错了就停下来让人排查，好过默默出事。**
+
+而「哪些工具进延迟集」的判断在 [`build_deferred_tool_setup()`](backend/packages/harness/deerflow/tools/builtins/tool_search.py:172)，核心就一行：
+
+```python
+deferred = [t for t in candidate_tools if is_mcp_tool(t)]
+```
+
+> 🎯 **划分标准极其清晰：只有带 `deerflow_mcp` 标签的（即 MCP 工具）才延迟，其余全部全量绑定。**
+> 为什么是 MCP？因为 MCP 是**用户可任意挂载的、数量不可控的、长尾的**——正是「工具爆炸」的来源。而内置工具、沙箱工具、配置的社区搜索工具，都是「少而核心、高频」的，延迟它们反而每次都要多一步检索，得不偿失。
+>
+> ⚠️ **特别注意：`tool_search` 自己绝不能延迟！** 否则模型没法发现任何延迟工具，直接死锁。它是全量绑定的。
+
+`DeferredToolSetup` 这个数据类还有个「同生共死」的不变量（[`tool_search.py:118`](backend/packages/harness/deerflow/tools/builtins/tool_search.py:118)）：
+
+```
+tool_search_tool 为 None  ⟺  deferred_names 为空  ⟺  catalog_hash 为 None
+```
+
+三个字段要么都有值（有延迟工具），要么都为空（没有延迟工具），**不会出现「有名字却没检索工具」这种半吊子状态**。
+
+---
+
+### 3.3 状态管家：`merge_promoted` —— 解锁记录存哪、怎么防出错
+
+前面反复提到「把解锁写进**图状态** `promoted`」。这一节讲清楚它到底是什么、为什么这么设计。
+
+**先回答：解锁记录为什么不用「全局变量」？**
+
+新手第一反应可能是「搞个全局字典记录解锁了哪些工具不就行了」。**不行**，原因：
+- **全局变量会被并发污染**：多个用户/多个线程同时跑 Agent，A 的解锁记录会串到 B 那里；
+- **不能回放**：Agent 支持「从某个检查点（checkpoint）恢复继续跑」，全局变量存不进检查点。
+
+**正确做法：存进「图状态（graph state）」。** 图状态是每个「线程（会话）」独立的、能随检查点持久化的。天然线程隔离、可回放。
+
+**它的结构** —— [`thread_state.py:105`](backend/packages/harness/deerflow/agents/thread_state.py:105)：
+
+```python
+class PromotedTools(TypedDict):
+    catalog_hash: str
+    names: list[str]
+```
+
+就俩字段：`catalog_hash`（工具目录指纹）+ `names`（已解锁的工具名列表）。
+
+**关键：reducer（合并器）`merge_promoted`** —— [`thread_state.py:110`](backend/packages/harness/deerflow/agents/thread_state.py:110)：
+
+```python
+def merge_promoted(existing, new):
+    if not new:
+        return existing
+    if existing is None or existing.get("catalog_hash") != new["catalog_hash"]:
+        return {
+            "catalog_hash": new["catalog_hash"],
+            "names": list(dict.fromkeys(new["names"])),
+        }
+    return {
+        "catalog_hash": existing["catalog_hash"],
+        "names": list(dict.fromkeys(existing["names"] + new["names"])),
+    }
+```
+
+**先解释什么是 reducer。** LangGraph 里，多个地方可能同时更新同一个状态字段（比如 `tool_search` 解锁一批、`McpRouting` 又自动解锁一批）。reducer 就是「**当同一个字段有新旧两份值时，怎么合并**」的规则。它挂在状态字段上：
+
+```python
+promoted: Annotated[PromotedTools, merge_promoted]  # thread_state.py:249 附近
+```
+
+`Annotated[类型, merge_promoted]` 的意思是「promoted 这个字段，合并时用 `merge_promoted` 函数」。
+
+**逐个分支拆 `merge_promoted`：**
+
+- **分支一 `if not new: return existing`**——新值是空的（这一步没动解锁），保留旧的。**防御式：没更新就别乱改。**
+
+- **分支二：`catalog_hash` 变了 → 整体替换，丢弃旧 names**
+  ```python
+  if existing is None or existing.get("catalog_hash") != new["catalog_hash"]:
+      return {"catalog_hash": new["catalog_hash"], "names": list(dict.fromkeys(new["names"]))}
+  ```
+  > 🎯 **这是最精华的一分支，兑现了前面所有伏笔！**
+  > 场景：用户上次跑的时候解锁了工具 X（旧目录），后来 MCP 工具改动了（比如 X 改了名或换了说明书），目录指纹变了。这时旧检查点里存的 `names=["X"]` **已经不可信**了——它可能指向一个改名后完全不同的工具！
+  > 所以：**只要 hash 不一样，就把旧记录整个扔掉，只用新的**。杜绝「旧记录误解锁了漂移后的工具」。这叫 **catalog drift（目录漂移）防护**。
+
+- **分支三：`catalog_hash` 相同 → 合并去重保序**
+  ```python
+  return {"catalog_hash": existing["catalog_hash"], "names": list(dict.fromkeys(existing["names"] + new["names"]))}
+  ```
+  目录没变，就把新旧解锁的名字**并起来**。`dict.fromkeys(...)` 是个 Python 惯用法：**去重的同时保持顺序**（set 去重会打乱顺序，dict 从 3.7 起保插入序）。
+
+> 💡 **为什么用「内容哈希」做版本，不用「手动版本号」？** 如果用版本号，改工具时得记得手动 `+1`，**人会忘**。内容哈希是「内容一变，指纹自动变」，**零维护、不会忘**。这是「用内容哈希做版本护栏」的经典手法。
+
+顺便看一眼旁边的 [`merge_artifacts`](backend/packages/harness/deerflow/agents/thread_state.py:58)（工具产物合并），同样用 `dict.fromkeys` 去重保序，思路一致——支持多个工具并行产出文件而不重复。
+
+---
+
+### 3.4 同步桥接：`make_sync_tool_wrapper` —— 让异步工具在同步厨房也能做
+
+**它在哪？** [`sync.py:36`](backend/packages/harness/deerflow/tools/sync.py:36)
+
+先讲清楚痛点。有些工具（比如 MCP 工具、`invoke_acp_agent`）**只有异步实现**（`async def`）。但调用它们的 Agent 可能跑在**同步**路径上。这就有矛盾了：
+
+**新手常见的错误想法：「那我直接 `asyncio.run(工具())` 不就行了？」**
+
+**不行，两个坑：**
+1. **坑一**：如果当前**已经有一个事件循环在运行**，你再调 `asyncio.run` 会直接报错：`RuntimeError: asyncio.run() cannot be called from a running event loop`（`asyncio.run` 会新建并关闭 loop，不能套在运行中的 loop 里）。
+2. **坑二**：如果换个线程去跑，又会**丢失 contextvars**（比如「当前用户是谁」「本次调用的 trace_id」这些上下文），因为 contextvars **不会自动跨线程传播**。
+
+看它怎么优雅解决这俩坑：
+
+```python
+def run_coroutine(*args, **kwargs):
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop is not None and loop.is_running():
+        context = contextvars.copy_context()
+        future = _SYNC_TOOL_EXECUTOR.submit(context.run, lambda: asyncio.run(coro(*args, **kwargs)))
+        return future.result()
+    return asyncio.run(coro(*args, **kwargs))
+```
+
+逐句拆：
+
+- **`asyncio.get_running_loop()` + try/except**：先探测「现在有没有正在跑的事件循环」。有就拿到 loop，没有就抛 `RuntimeError`，我们接住设为 `None`。
+- **情况 A：有正在跑的 loop（`loop.is_running()`）**——这是最棘手的情况：
+  - `contextvars.copy_context()`：**把当前上下文拍个快照**（用户、trace 等信息都在里面）；
+  - `_SYNC_TOOL_EXECUTOR.submit(context.run, ...)`：**提交到一个独立线程池**去执行，并用 `context.run(...)` **在那个�照上下文里跑**——这样即使换了线程，上下文也没丢；
+  - 线程里再 `asyncio.run(coro(...))`：因为是**新线程**，没有正在跑的 loop，`asyncio.run` 就能安全地新建 loop 跑异步工具了；
+  - `future.result()`：等它跑完拿结果。
+  - **效果**：既不阻塞当前主 loop（活儿甩给了别的线程），又保住了 contextvar。
+- **情况 B：没有正在跑的 loop**——简单，直接 `asyncio.run(coro(...))`。
+
+**那个线程池是什么？** 看文件顶部 [`sync.py:16`](backend/packages/harness/deerflow/tools/sync.py:16)：
+
+```python
+_SYNC_TOOL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=10, thread_name_prefix="tool-sync")
+atexit.register(lambda: _SYNC_TOOL_EXECUTOR.shutdown(wait=False))
+```
+
+- `max_workers=10`：最多 10 个线程并行跑异步工具（`thread_name_prefix` 给线程起名字，方便调试时看日志）。
+- **`atexit.register(...)`：程序退出时自动关闭线程池**，`wait=False` 表示「不等它们跑完，直接关」，避免卡住退出。**善后要做干净。**
+
+**还有一个细节：透传 `RunnableConfig`** —— [`_get_runnable_config_param()`](backend/packages/harness/deerflow/tools/sync.py:21)：
+
+```python
+def _get_runnable_config_param(func):
+    if isinstance(func, functools.partial):
+        func = func.func
+    try:
+        type_hints = get_type_hints(func)
+    except Exception:
+        return None
+    for name, type_ in type_hints.items():
+        if type_ is RunnableConfig:
+            return name
+    return None
+```
+
+这段是「**探测这个异步工具有没有声明一个 `RunnableConfig` 类型的参数**」（有些工具如 `invoke_acp_agent` 需要 LangChain 注入运行配置）。如果有，同步壳就暴露一个 `config` 参数，让 LangChain 能注入，再转发给工具。
+
+> 💡 **`isinstance(func, functools.partial)` 那步在干嘛？** 有些函数是被 `functools.partial` 包过的，要先剥开拿到真正的原函数才能读它的类型注解。又是一处防御性处理。
+>
+> 💡 **`get_type_hints` 也用 try/except 包着**——万一读类型注解失败，返回 None（当作没有 config 参数），不崩。
+
+**回头看装配层的第 5 步就懂了** —— [`_ensure_sync_invocable_tool()`](backend/packages/harness/deerflow/tools/tools.py:37)：
+
+```python
+def _ensure_sync_invocable_tool(tool: BaseTool) -> BaseTool:
+    if getattr(tool, "func", None) is None and getattr(tool, "coroutine", None) is not None:
+        tool.func = make_sync_tool_wrapper(tool.coroutine, tool.name)
+    return tool
+```
+
+意思是：**如果这个工具没有同步实现（`func` 是 None）、但有异步实现（`coroutine` 不是 None）**，就给它的 `func` 挂上一个「同步壳」。这样同步路径调 `tool.func` 时，壳会帮它安全地跑异步逻辑。
+
+> 🎯 **GIL 会不会让线程池没意义？**（进阶思考）Python 有全局解释器锁（GIL），同一时刻只有一个线程执行 Python 字节码。但这些异步工具大多是 **I/O 密集**（发网络请求、读写文件），I/O 等待时会**释放 GIL**，其他线程能干活——所以多线程对 I/O 密集有效。只有 CPU 密集才会被 GIL 卡住。
+
+---
+
+
+
