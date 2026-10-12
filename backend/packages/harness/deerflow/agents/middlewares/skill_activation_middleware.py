@@ -13,10 +13,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, override
 
+from deerflow_extension_api import ContentKind, provenance_kwargs
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ModelRequest, ModelResponse
 from langchain_core.messages import AIMessage, HumanMessage
 
+from deerflow.runtime.events.catalog import (
+    MIDDLEWARE_SKILL_ACTIVATION_TAG,
+    MIDDLEWARE_SKILL_SECRETS_TAG,
+)
 from deerflow.runtime.secret_context import (
     _SECRETS_BINDING_AUDIT_KEY,
     _SLASH_SKILL_ACTIVATION_RUN_KEY,
@@ -102,6 +107,13 @@ class SkillActivationMiddleware(AgentMiddleware):
         self._app_config = app_config
         self._user_id = user_id
         self._slash_source_owner_token = slash_source_owner_token
+
+    def release_policy_parameters(self) -> dict[str, object]:
+        return {
+            # None means "any enabled, runtime-allowed skill may be activated";
+            # a concrete list narrows that to a fixed set.
+            "available_skills": sorted(self._available_skills) if self._available_skills is not None else None,
+        }
 
     def _storage(self) -> SkillStorage:
         if self._user_id is not None:
@@ -294,7 +306,7 @@ Follow this skill before choosing a general workflow. Load supporting resources 
             return
         try:
             journal.record_middleware(
-                "skill_activation",
+                MIDDLEWARE_SKILL_ACTIVATION_TAG,
                 name="SkillActivationMiddleware",
                 hook=hook,
                 action="activate",
@@ -306,7 +318,7 @@ Follow this skill before choosing a general workflow. Load supporting resources 
                 },
             )
         except Exception:
-            logger.debug("Failed to record slash skill activation audit event", exc_info=True)
+            logger.warning("Failed to record slash skill activation audit event", exc_info=True)
 
     def _prepare_model_request(self, request: ModelRequest, *, hook: str) -> tuple[ModelRequest | AIMessage | None, _Activation | None]:
         run_context = self._run_context(request)
@@ -533,14 +545,14 @@ Follow this skill before choosing a general workflow. Load supporting resources 
             return
         try:
             journal.record_middleware(
-                "skill_secrets",
+                MIDDLEWARE_SKILL_SECRETS_TAG,
                 name="SkillActivationMiddleware",
                 hook=hook,
                 action="bind_secrets",
                 changes=audit_state,
             )
         except Exception:
-            logger.debug("Failed to record skill secret binding audit event", exc_info=True)
+            logger.warning("Failed to record skill secret binding audit event", exc_info=True)
 
     @staticmethod
     def _make_activation_message(target: HumanMessage, activation_content: str) -> HumanMessage:
@@ -548,6 +560,7 @@ Follow this skill before choosing a general workflow. Load supporting resources 
         additional_kwargs = {
             "hide_from_ui": True,
             _SLASH_SKILL_ACTIVATION_KEY: True,
+            **provenance_kwargs(ContentKind.SKILL_BODY, "skill_activation"),
         }
         if target.id:
             additional_kwargs[_SLASH_SKILL_ACTIVATION_TARGET_ID_KEY] = target.id

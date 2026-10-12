@@ -3,17 +3,27 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import yaml
 from fastapi.testclient import TestClient
 
+from app.gateway.routers.agents import AGENT_NAME_PATTERN as GATEWAY_AGENT_NAME_PATTERN
+from deerflow.agents.memory.backends.deermem.deermem.core.paths import AGENT_NAME_PATTERN as DEERMEM_AGENT_NAME_PATTERN
+from deerflow.agents.memory.backends.deermem.deermem.core.paths import DEFAULT_AGENT_BUCKET, validate_agent_name
 from deerflow.config.agents_api_config import AgentsApiConfig, get_agents_api_config, set_agents_api_config
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def test_reserved_memory_bucket_stays_outside_both_public_agent_patterns() -> None:
+    assert GATEWAY_AGENT_NAME_PATTERN.fullmatch(DEFAULT_AGENT_BUCKET) is None
+    assert DEERMEM_AGENT_NAME_PATTERN.fullmatch(DEFAULT_AGENT_BUCKET) is None
+    validate_agent_name(DEFAULT_AGENT_BUCKET)  # Internal storage sentinel remains usable.
 
 
 def _make_paths(base_dir: Path):
@@ -477,16 +487,16 @@ class TestMemoryFilePath:
         assert path == tmp_path / "memory.json"
 
     def test_agent_memory_path(self, tmp_path, monkeypatch):
-        """Providing agent_name should return per-agent memory file."""
+        """All agents share the user-global summary JSON path."""
         from deerflow.agents.memory.backends.deermem.deermem.config import DeerMemConfig
         from deerflow.agents.memory.backends.deermem.deermem.core.storage import FileMemoryStorage
 
         monkeypatch.setenv("DEERMEM_DATA_DIR", str(tmp_path))
         storage = FileMemoryStorage(DeerMemConfig())
         path = storage._get_memory_file_path("code-reviewer")
-        assert path == tmp_path / "agents" / "code-reviewer" / "memory.json"
+        assert path == tmp_path / "memory.json"
 
-    def test_different_paths_for_different_agents(self, tmp_path, monkeypatch):
+    def test_agents_share_summary_path(self, tmp_path, monkeypatch):
         from deerflow.agents.memory.backends.deermem.deermem.config import DeerMemConfig
         from deerflow.agents.memory.backends.deermem.deermem.core.storage import FileMemoryStorage
 
@@ -496,14 +506,26 @@ class TestMemoryFilePath:
         path_a = storage._get_memory_file_path("agent-a")
         path_b = storage._get_memory_file_path("agent-b")
 
-        assert path_global != path_a
-        assert path_global != path_b
-        assert path_a != path_b
+        assert path_global == path_a == path_b
 
 
 # ===========================================================================
 # 8. Gateway API – Agents endpoints
 # ===========================================================================
+
+
+# Model names the agents API tests may send in a create/update payload. The
+# router validates `model` against the app config, so the fixture pins a stub
+# config exposing exactly these instead of leaving the assertion at the mercy
+# of whatever `config.yaml` happens to sit in the repo root: CI has none (the
+# validation is skipped and the request passes), a real dev checkout does (an
+# unlisted model name yields 422 and the test fails).
+_KNOWN_TEST_MODELS = frozenset({"deepseek-v3"})
+
+
+def _stub_app_config():
+    """App config that knows only ``_KNOWN_TEST_MODELS``."""
+    return SimpleNamespace(get_model_config=lambda name: SimpleNamespace(name=name) if name in _KNOWN_TEST_MODELS else None)
 
 
 def _make_test_app(tmp_path: Path):
@@ -525,7 +547,11 @@ def agent_client(tmp_path):
     paths_instance = _make_paths(tmp_path)
     previous_config = AgentsApiConfig(**get_agents_api_config().model_dump())
 
-    with patch("deerflow.config.agents_config.get_paths", return_value=paths_instance), patch.object(agents_router, "get_paths", return_value=paths_instance):
+    with (
+        patch("deerflow.config.agents_config.get_paths", return_value=paths_instance),
+        patch.object(agents_router, "get_paths", return_value=paths_instance),
+        patch.object(agents_router, "get_app_config", _stub_app_config),
+    ):
         set_agents_api_config(AgentsApiConfig(enabled=True))
         try:
             app = _make_test_app(tmp_path)
@@ -729,6 +755,22 @@ class TestAgentsAPI:
     def test_delete_missing_agent_404(self, agent_client):
         response = agent_client.delete("/api/agents/does-not-exist")
         assert response.status_code == 404
+
+    def test_delete_rejects_memory_only_directory_without_removing_facts(self, agent_client, tmp_path):
+        agent_dir = tmp_path / "users" / "test-user-autouse" / "agents" / "lead-agent"
+        facts_dir = agent_dir / "facts"
+        facts_dir.mkdir(parents=True)
+        fact_path = facts_dir / "fact_keep.md"
+        fact_path.write_text("memory data", encoding="utf-8")
+
+        response = agent_client.delete("/api/agents/lead-agent")
+
+        assert response.status_code == 409
+        assert fact_path.read_text(encoding="utf-8") == "memory data"
+
+    def test_reserved_default_bucket_cannot_be_created_as_custom_agent(self, agent_client):
+        response = agent_client.post("/api/agents", json={"name": "__default__", "soul": "must fail"})
+        assert response.status_code == 422
 
     def test_create_agent_with_model_and_tool_groups(self, agent_client):
         payload = {

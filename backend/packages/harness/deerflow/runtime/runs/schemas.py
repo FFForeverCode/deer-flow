@@ -3,6 +3,15 @@
 from enum import StrEnum
 
 
+class ThreadOperationKind(StrEnum):
+    """Kind of operation holding exclusive admission for a thread."""
+
+    run = "run"
+    checkpoint_write = "checkpoint_write"
+    artifact_write = "artifact_write"
+    delete = "delete"
+
+
 class RunStatus(StrEnum):
     """Lifecycle status of a single run."""
 

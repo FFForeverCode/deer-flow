@@ -379,7 +379,7 @@ def _scan_python(rel_path: str, text: str) -> list[SecurityFinding]:
         call_name = _python_call_name(node, aliases)
         if call_name in {"eval", "exec"} or (call_name == "compile" and _compile_mode_is_exec(node)):
             findings.append(_finding_for_node("python-dynamic-exec", rel_path, node, call_name))
-        elif call_name in {"os.system", "os.popen"} or (call_name.startswith("subprocess.") and _call_has_shell_true(node)):
+        elif call_name in {"os.system", "os.popen"} or (call_name.startswith("subprocess.") and _call_shell_may_be_true(node)):
             findings.append(_finding_for_node("python-shell-exec", rel_path, node, call_name))
         elif call_name.startswith("subprocess."):
             findings.append(_finding_for_node("python-subprocess", rel_path, node, call_name))
@@ -691,8 +691,27 @@ def _compile_mode_is_exec(node: ast.Call) -> bool:
     return any(keyword.arg == "mode" and isinstance(keyword.value, ast.Constant) and keyword.value.value == "exec" for keyword in node.keywords)
 
 
-def _call_has_shell_true(node: ast.Call) -> bool:
-    return any(keyword.arg == "shell" and isinstance(keyword.value, ast.Constant) and keyword.value.value is True for keyword in node.keywords)
+def _call_shell_may_be_true(node: ast.Call) -> bool:
+    # Fail closed on ambiguity: a ``shell=`` keyword is only safe when it is a
+    # literal, statically-provable ``False``. Any other value under that keyword,
+    # the literal ``True``, any other literal, or a non-literal expression such as
+    # a variable or a function call (``shell=shell_flag``, ``shell=bool(1)``),
+    # cannot be proven safe by static analysis, so it is treated the same as an
+    # explicit ``shell=True`` rather than silently falling through to the
+    # non-blocking ``python-subprocess`` classification.
+    for keyword in node.keywords:
+        if keyword.arg is None:
+            # ``**mapping`` / ``**kwargs`` unpacking: represented in the AST as a
+            # keyword with ``arg is None``. The mapping's contents (and whether it
+            # even carries a ``shell`` key) are not knowable by static analysis, so
+            # this fails closed the same as a variable/expression shell= value.
+            # Deliberate, documented over-block: a harmless kwargs-unpack with no
+            # ``shell`` key also blocks, since the alternative (inspecting the
+            # unpacked mapping's contents) is not generally possible statically.
+            return True
+        if keyword.arg == "shell":
+            return not (isinstance(keyword.value, ast.Constant) and keyword.value.value is False)
+    return False
 
 
 def _call_is_network_sink(call_name: str) -> bool:
@@ -729,6 +748,13 @@ def _call_is_network_sink(call_name: str) -> bool:
 # handles. Comprehensions, walrus-bearing statements, annotations, and executable expressions
 # in complex binding targets deliberately produce no finding from this signal; any names those
 # skipped constructs may bind are invalidated so stale state cannot create a finding.
+#
+# Handles reached by a value rather than by a name -- an attribute, a container item, a factory
+# return, a locally aliased constructor, a dynamic `getattr` -- and sinks invoked as anything other
+# than `name.method(...)` are outside that chain by construction: following them is value tracking,
+# which RFC #2634 puts beyond Phase 5. These are scope decisions, not gaps; issue #4296 enumerates
+# them and `test_python_declared_false_negatives_stay_unreported` pins each one, so widening or
+# narrowing the model has to change that test rather than change behaviour silently.
 #
 # Compound bodies are still walked from isolated entry-state copies so `if True:` is not a
 # universal bypass, but ambiguous bindings are dropped rather than joined. Every AST visit
@@ -844,6 +870,14 @@ def _walk_client_scope(node: ast.AST, scope: _ClientScope, inherited: _ClientSco
         return
     if isinstance(node, ast.NamedExpr):
         _drop_client_bindings(scope, set(_client_assignment_target_names(node.target)))
+        return
+    if isinstance(node, ast.TypeAlias):
+        # PEP 695: the value of `type X = ...` is evaluated lazily -- never on import, only on a
+        # later access to `X.__value__`. Walking it for sinks reports egress that cannot happen and
+        # hard-blocks a benign file, the same reason annotations are not walked (see
+        # _client_scope_prelude). The name it binds is invalidated here rather than descended into,
+        # so skipping the value cannot leave a stale handle behind.
+        _drop_client_bindings(scope, set(_client_assignment_target_names(node.name)))
         return
     if isinstance(node, _PYTHON_BRANCHING_NODES):
         _walk_client_branching(node, scope, inherited, analysis)

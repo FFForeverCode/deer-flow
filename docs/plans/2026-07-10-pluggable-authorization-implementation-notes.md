@@ -200,6 +200,155 @@ Phase 1 最低验证要求：
 - **延期：** RBAC provider、provider factory、Layer 1 过滤、Layer 2 自动接线移至
   Phase 1A-2 / Phase 1B。
 
+### 2026-07-17 — Phase 1A-2 / 内置 RBAC provider 与 provider factory
+
+- **背景：** Phase 1A-1 建立了可信 Principal 链路，但没有策略引擎。
+  Phase 1A-2 实现内置 RBAC provider 和统一 provider factory。
+- **决策：** `RbacAuthorizationProvider` 在构造时完成全部配置校验并编译为
+  不可变结构（`frozenset` / sentinel `_ALL`）。请求路径只做 O(1) membership 检查。
+- **决策：** deny 永远优先于 allow，无论 allow 是 `"*"`、`True`、列表还是缺失。
+- **决策：** 未知角色和缺失角色抛 `ValueError`（不返回 allow），由执行层
+  根据 `fail_closed` 决定。
+- **决策：** 资源名使用显式映射（`tool → tools`，`model → models` 等），
+  不通过加 `s` 猜测。配置中的保留请求别名（如 `tool`）在构造期拒绝，并提示使用
+  对应配置键（如 `tools`），防止策略被存储在永远无法命中的键下。未知 resource
+  使用原名查找；未配置时视为"不受限"。
+- **决策：** `resolve_authorization_provider()` 是唯一 provider 解析入口。
+  disabled 时返回 `None`（不 import provider 模块）；enabled 但缺少 provider
+  时抛 `ValueError`。不缓存实例。不注入 `fail_closed` 或 `default_role`。
+- **决策：** 内置和自定义 provider 使用完全相同的 `resolve_variable` class-path
+  解析路径，无特殊分支。
+- **证据：** 66 tests passed（51 RBAC + 15 factory，其中 5 条为 malformed-policy
+  回归测试）。
+- **兼容性：** 无运行时行为变化（`authorization.enabled: false`）。不修改
+  `config.example.yaml`，不 bump `config_version`。
+- **延期：** Layer 1 工具过滤、Layer 2 自动接线、DeerFlowClient、RBAC 配置示例
+  移至 Phase 1B。
+- **Phase 1B 注意：** 已知角色缺少某个 resource policy 时语义是“不受限”，不是
+  fail-closed。配置示例必须明确提醒，并枚举部署方希望限制的每种 resource。
+- **Phase 1B 注意：** 内置 RBAC 当前按 role + resource + target 决策，不区分
+  `AuthzRequest.action`；`policy_id` 也是稳定但粗粒度的
+  `rbac:allow` / `rbac:deny` / `rbac:unrestricted`。接入审计日志前应决定是否通过
+  更具体的 policy id 或 decision metadata 记录 role / resource / target。
+
+### 2026-07-20 — Phase 1A-2 / PR #4260 请求边界收口
+
+- **背景：** review 发现 `request.target` 未经运行时校验；通配符策略会允许
+  `None` 或空字符串，而列表策略会拒绝，形成依赖策略形态的不一致结果。进一步审查
+  发现无效 resource 和批量过滤候选项也存在相同的“不受限/通配符路径放行”风险。
+- **决策：** 内置 RBAC 在请求边界要求 resource、resource type、target 和每个
+  candidate 都是非空字符串；`filter_resources()` 还要求 candidates 是 list。
+  非法输入统一抛 `ValueError`，不能进入 `rbac:unrestricted` 或通配符 allow 路径。
+- **决策：** `filter_resources()` 对缺失/未知角色继续与 `authorize()` 一致地抛
+  `ValueError`，不在 provider 内静默返回空列表。Phase 1B 集成层负责按
+  `fail_closed` 处理 provider 异常，避免隐藏身份或部署配置错误。
+- **证据：** 90 tests passed（75 RBAC + 15 factory），覆盖 unrestricted、
+  wildcard、allow-list、同步/异步、非法 resource/target/candidates，以及
+  `filter_resources()` 的缺失/未知角色错误语义。
+- **兼容性：** 只拒绝不符合 `AuthzRequest` / `filter_resources` 类型契约的运行时
+  输入；Phase 1A-2 仍未接入运行时，`authorization.enabled: false` 行为不变。
+
+### 2026-07-22 — Phase 1B / 工具授权执行接入
+
+- **背景：** Phase 1A 完成了 Principal 链路、RBAC provider 和 factory。
+  Phase 1B 将 provider 接入 Layer 1（组装时过滤）和 Layer 2（执行时拦截）。
+- **决策：** `apply_tool_authorization()` 是 Layer 1 的统一入口，组合 provider
+  解析、Principal 构建和 `filter_tools_by_authorization` 过滤。disabled 时返回
+  原始工具和 `None`。
+- **决策：** Layer 1 过滤在 `assemble_deferred_tools` 之前执行，覆盖三条路径：
+  lead agent（bootstrap + default）、subagent、embedded client。
+- **决策：** Layer 2 通过 `GuardrailAuthorizationAdapter` 复用 `GuardrailMiddleware`，
+  authorization middleware 在显式 guardrail 之前（外层），两者独立运行。
+- **决策：** Layer 1 和 Layer 2 尝试共享同一个 provider 实例（"resolve once per
+  build"）。subagent 通过 `_authz_provider` 属性传递。
+- **决策：** Embedded client `_agent_config_key` 加入 `user_role` 和 `is_internal`
+  作为 cache key，角色变化时强制重建 agent。
+- **兼容性：** `authorization.enabled: false` 时工具集合和执行决策完全不变。
+- **延期：** Models/Skills/Sandbox 权限（Phase 2+）；route-level 迁移。
+
+#### Phase 1B review 收口
+
+- Layer 1 的候选集合必须包含本次 build 最终可能暴露给模型的全部业务工具；
+  `describe_skill` 和 memory tools 因此在授权过滤前加入，过滤后才进行 deferred
+  assembly。框架生成的 `tool_search` 仍是受已过滤 catalog 约束的基础设施工具。
+- lead、bootstrap、native subagent 和 embedded client 都把 Layer 1 解析出的同一
+  provider 实例传给 Layer 2，禁止在 middleware 构建时再次解析 provider。
+- `tool_search` 仅在当前 build 确实生成了 deferred catalog 时作为基础设施工具跳过
+  authorization adapter 的第二次 provider 调用；catalog 已由 Layer 1 过滤。显式配置的
+  guardrail 仍会检查它，没有 deferred setup 的普通同名工具也不获得豁免。
+- 内置 RBAC provider 在解析时校验 `authorization.default_role` 属于已配置角色，配置
+  错误直接阻止 agent 构建，不再表现为难以诊断的空工具集合。
+- `DeerFlowClient.stream()` 的调用方属于可信进程内边界，可通过关键字参数传入与
+  Gateway runtime context 相同的授权身份字段；这些字段同时进入真实执行 context。
+  agent cache key 使用完整 Principal（包括 user/channel/oauth/internal/attributes），
+  并深拷贝嵌套 attributes，防止调用方原地修改身份数据后复用旧工具集合。
+- disabled 模式仍在 Layer 1 候选阶段包含 `describe_skill` / memory tools，但 deferred
+  assembly 后恢复原有顺序（业务工具、`tool_search`、late framework tools）。
+- 回归测试必须经过真实 lead/bootstrap、subagent 和 embedded 组装函数，不能只测试
+  `filter_tools_by_authorization()` helper；同时断言被拒绝工具不在最终 bound tools 中，
+  且 Layer 2 收到的 provider 与 Layer 1 为同一对象。
+
+### 2026-07-24 — Phase 2A / Gateway route permissions
+
+- **背景：** `@require_permission` 已覆盖 Gateway 的 threads/runs 普通路由，但
+  `AuthMiddleware` 和 decorator-only `_authenticate()` 都向每个已认证用户写入固定
+  `_ALL_PERMISSIONS`，所以 Phase 1 的 provider 还不能限制 HTTP route。
+- **决策：** `resolve_route_permissions()` 是唯一 route provider 入口；两条认证路径
+  都调用它，并把结果缓存到 request-scoped `AuthContext`。每个已注册 permission
+  生成独立 `AuthzRequest(resource="route", action=<action>,
+  target="<resource>:<action>")`，通过 `aauthorize()` 求值。
+- **决策：** 单项 decision 异常只按 `authorization.fail_closed` 影响对应 permission，
+  不能因为求值其他五项的 incidental failure 扩大当前 route 的拒绝范围。provider
+  解析失败按同一配置返回空权限或 legacy 全权限。
+- **兼容性：** `authorization.enabled: false` 时不解析 provider，继续返回原有六项
+  threads/runs 权限。`owner_check` 与 `require_admin_user()` 保持独立且不变。
+- **证据：** 新增 route policy、trusted principal、async provider、fail-open /
+  fail-closed、middleware/decorator 共用和 built-in RBAC 覆盖；既有 auth 与 middleware
+  回归测试一并执行。
+- **延期：** Models、Skills、Sandbox 权限；前端 effective-permissions 展示；
+  management route 的 provider 迁移。
+
+### 2026-07-28 — Phase 3 / Models authorization (list / use)
+
+- **背景：** Phase 2A 合并后，route-level 权限已由 provider 派生，但模型仍然对所有
+  已认证用户开放——`list_models` 返回全部模型，`_resolve_model_name` 不检查角色。
+  RFC §9 Phase 3 要求覆盖 Models/Skills/Sandbox 三个资源类型。
+- **决策（Gateway 路由层）：** 新增 `resolve_model_authorization(user, *, is_internal)`
+  返回 `(provider, principal)`，复用 Phase 2A 的 `_get_cached_route_provider` 和
+  `build_principal_from_context`，包括 `INTERNAL_SYSTEM_ROLE → None` pop。
+  `list_models` 使用 `provider.filter_resources(principal, "model", names)` 批量过滤；
+  `get_model` 使用 `provider.authorize(AuthzRequest(resource="model", action="use",
+  target=model_name))`。deny → 403（模型存在但角色无权使用），provider 解析失败 →
+  `_AuthorizationUnavailable`（携带 `fail_closed` 标志）。
+- **决策（运行时解析层）：** 新增 `_authorize_model_name(model_name, *, context,
+  app_config)` 在 `_resolve_model_name` 之后执行。deny 时按 RFC §9 优雅降级：回退到
+  `filter_resources` 返回的第一个允许模型并记录 warning，而不是崩溃。全部模型被拒 +
+  `fail_closed` → `ValueError`（与现有"无模型配置"契约一致）；fail-open 返回原名。
+  fallback 阶段对每个候选重新调 `authorize("model", "use", candidate)` 验证，避免
+  custom provider 在 `filter_resources`（action-agnostic）里可见但 `use` 被拒的模型被
+  静默选中。
+- **决策（embedded/library 路径）：** `_authorize_model_name` 同样接入
+  `DeerFlowClient._ensure_agent`（client.py），与 Gateway runtime 路径 `_make_lead_agent`
+  对称。否则 library/embedded 消费者启用 `authorization` + role-scoped model policy 时，
+  tools 会被过滤但模型仍可绕过 `model:use`。调用前先把 `None` 默认解析为第一个配置模型
+  （与 `create_chat_model(name=None)` 的语义一致），确保隐式默认模型也经过授权。
+- **否决方案：** 不为 `get_model` 引入 `"read"` action——RFC §9 将 `get_model` 映射到
+  `model:use`，引入第三个 action 会增加 RBAC 配置面而无实际收益。不在 `_resolve_model_name`
+  内部做授权——该函数是纯解析（request → config → default fallback），授权检查放在调用
+  点之后，保持单一职责。
+- **兼容性：** `authorization.enabled: false` 时两条路径均为 no-op（路由返回全部模型，
+  解析返回原名）。匿名请求（user=None）不触发过滤。RBAC provider 的 `_RESOURCE_POLICY_KEYS`
+  已包含 `"model": "models"`，无需 schema 变更。
+- **证据：** `tests/test_models_authorization.py`（24 tests）覆盖 disabled/anonymous/
+  RBAC allow/deny/wildcard/fail-closed/fail-open 路由场景，disabled/allowed/
+  graceful-fallback/all-denied-fail-closed/all-denied-fail-open/custom-provider-list-vs-use/
+  no-usable-fallback 运行时场景，以及 `DeerFlowClient._ensure_agent` 的 model:use 强制 +
+  None 默认解析 + disabled no-op 集成场景；
+  `test_authorization_*.py` + `test_lead_agent_model_resolution.py` +
+  `test_auth_middleware.py` 共 318 tests 全部通过。
+- **延期：** Skills、Sandbox 权限（Phase 3 后续 PR）；前端 effective-permissions 展示；
+  management route 的 provider 迁移。
+
 ### 新记录模板
 
 ```markdown

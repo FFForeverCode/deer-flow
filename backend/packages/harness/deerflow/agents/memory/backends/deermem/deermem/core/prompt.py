@@ -758,13 +758,20 @@ def format_conversation_for_update(messages: list[Any]) -> str:
         # ephemeral file path info into long-term memory.  Skip the turn entirely
         # when nothing remains after stripping (upload-only message).
         if role == "human":
-            content = re.sub(r"<uploaded_files>[\s\S]*?</uploaded_files>\n*", "", str(content)).strip()
+            content = re.sub(r"<(?P<tag>uploaded_files|current_uploads)>[\s\S]*?</(?P=tag)>\n*", "", str(content)).strip()
             if not content:
                 continue
 
-        # Truncate very long messages
+        # Truncate very long messages: keep the head (topic / opening) and the
+        # tail (conclusion / "remember X" instruction), dropping the middle.
+        # A head-only chop loses the tail's directives; a head+tail split
+        # preserves both. The separator is plain ASCII (no < > &) so the
+        # html.escape below leaves it intact and tells the LLM where text was
+        # cut. Escape happens after truncation, so the boundary never splits an
+        # entity (entities only exist after escaping).
         if len(str(content)) > 1000:
-            content = str(content)[:1000] + "..."
+            s = str(content)
+            content = s[:500] + "\n...[truncated]...\n" + s[-500:]
 
         # Escape < > & before embedding into the <conversation> block of
         # the memory_update prompt. This raw user turn is the most attacker-influenced

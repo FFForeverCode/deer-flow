@@ -76,6 +76,11 @@ def test_detect_reinforcement_default_bundled():
     assert detect_reinforcement(msgs) is True
 
 
+def test_detect_reinforcement_explicit_durable_chinese_confirmation():
+    msgs = [_human("对，我就是喜欢简洁回答，以后都保持这样。")]
+    assert detect_reinforcement(msgs) is True
+
+
 def test_detect_correction_patterns_override():
     custom = [re.compile(r"zzz")]
     assert detect_correction([_human("zzz here")], patterns=custom) is True
@@ -107,13 +112,12 @@ def test_prepare_update_missing_role_returns_none(tmp_path):
     assert m._prepare_update([]) is None
 
 
-def test_prepare_update_returns_3tuple_with_correction_true(tmp_path):
+def test_prepare_update_returns_signals_with_correction(tmp_path):
     m = _make_deermem(tmp_path)
     r = m._prepare_update([_human("That's wrong, use uv"), _ai("ok")])
-    assert r is not None and len(r) == 3
-    filtered, corr, rein = r
-    assert corr is True
-    assert rein is False
+    assert r is not None and len(r) == 2
+    filtered, signals = r
+    assert "correction" in signals
     assert len(filtered) == 2
 
 

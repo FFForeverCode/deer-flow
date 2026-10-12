@@ -162,6 +162,41 @@ async def test_close_scope():
 
 
 @pytest.mark.asyncio
+async def test_close_session_only_evicts_the_exact_server_scope_pair():
+    pool = MCPSessionPool()
+
+    class CmFactory:
+        def __init__(self):
+            self.closed = False
+
+        async def __aenter__(self):
+            return AsyncMock()
+
+        async def __aexit__(self, *args):
+            self.closed = True
+            return False
+
+    cms: list[CmFactory] = []
+
+    def make_cm(*_args, **_kwargs):
+        cm = CmFactory()
+        cms.append(cm)
+        return cm
+
+    with patch("langchain_mcp_adapters.sessions.create_session", side_effect=make_cm):
+        await pool.get_session("s1", "t1", {"transport": "stdio", "command": "x", "args": []})
+        await pool.get_session("s2", "t1", {"transport": "stdio", "command": "x", "args": []})
+        await pool.get_session("s1", "t2", {"transport": "stdio", "command": "x", "args": []})
+
+    await pool.close_session("s1", "t1")
+
+    assert cms[0].closed is True
+    assert cms[1].closed is False
+    assert cms[2].closed is False
+    assert set(pool._entries) == {("s2", "t1"), ("s1", "t2")}
+
+
+@pytest.mark.asyncio
 async def test_close_all():
     """close_all shuts down every session."""
     pool = MCPSessionPool()
@@ -267,7 +302,8 @@ async def test_session_pool_tool_pins_cwd_and_temp_env(tmp_path):
     from pydantic import BaseModel, Field
 
     from deerflow.config.paths import Paths
-    from deerflow.mcp.tools import _MCP_TMP_SUBDIR, _make_session_pool_tool
+    from deerflow.constants import MCP_TMP_SUBDIR
+    from deerflow.mcp.tools import _make_session_pool_tool
 
     class Args(BaseModel):
         url: str = Field(..., description="url")
@@ -301,7 +337,7 @@ async def test_session_pool_tool_pins_cwd_and_temp_env(tmp_path):
 
     session_connection = create_session.call_args.args[0]
     workspace = paths.sandbox_work_dir("thread-42", user_id="user-7")
-    tmp_dir = workspace / _MCP_TMP_SUBDIR
+    tmp_dir = workspace / MCP_TMP_SUBDIR
 
     assert session_connection["cwd"] == str(workspace)
     assert session_connection["env"]["KEEP"] == "1"
@@ -319,7 +355,8 @@ async def test_session_pool_tool_does_not_override_explicit_tmpdir(tmp_path):
     from pydantic import BaseModel, Field
 
     from deerflow.config.paths import Paths
-    from deerflow.mcp.tools import _MCP_TMP_SUBDIR, _make_session_pool_tool
+    from deerflow.constants import MCP_TMP_SUBDIR
+    from deerflow.mcp.tools import _make_session_pool_tool
 
     class Args(BaseModel):
         url: str = Field(..., description="url")
@@ -354,7 +391,7 @@ async def test_session_pool_tool_does_not_override_explicit_tmpdir(tmp_path):
     session_connection = create_session.call_args.args[0]
     # Operator-provided TMPDIR is preserved; TMP/TEMP still get our default.
     assert session_connection["env"]["TMPDIR"] == "/operator/tmp"
-    assert session_connection["env"]["TMP"].endswith(_MCP_TMP_SUBDIR)
+    assert session_connection["env"]["TMP"].endswith(MCP_TMP_SUBDIR)
 
 
 @pytest.mark.asyncio
@@ -364,7 +401,8 @@ async def test_session_pool_tool_does_not_override_explicit_cwd(tmp_path):
     from pydantic import BaseModel, Field
 
     from deerflow.config.paths import Paths
-    from deerflow.mcp.tools import _MCP_TMP_SUBDIR, _make_session_pool_tool
+    from deerflow.constants import MCP_TMP_SUBDIR
+    from deerflow.mcp.tools import _make_session_pool_tool
 
     class Args(BaseModel):
         url: str = Field(..., description="url")
@@ -399,7 +437,7 @@ async def test_session_pool_tool_does_not_override_explicit_cwd(tmp_path):
 
     session_connection = create_session.call_args.args[0]
     workspace = paths.sandbox_work_dir("thread-42", user_id="user-7")
-    tmp_dir = workspace / _MCP_TMP_SUBDIR
+    tmp_dir = workspace / MCP_TMP_SUBDIR
 
     assert session_connection["cwd"] == operator_cwd
     assert session_connection["env"]["TMPDIR"] == str(tmp_dir)
@@ -588,6 +626,59 @@ async def test_session_pool_tool_forwards_interceptor_headers():
         await wrapped.coroutine(runtime=None, x=1)
 
     mock_session.call_tool.assert_awaited_once_with("act", {"x": 1}, meta={"headers": {"X-User-Id": "u-42"}})
+
+
+@pytest.mark.asyncio
+async def test_session_pool_interceptor_reads_request_scoped_secret():
+    """Interceptors can read request-scoped secrets from LangGraph context."""
+    from langchain_core.tools import StructuredTool
+    from pydantic import BaseModel, Field
+
+    from deerflow.mcp.tools import _make_session_pool_tool
+
+    class Args(BaseModel):
+        x: int = Field(..., description="x")
+
+    original_tool = StructuredTool(
+        name="srv_act",
+        description="test",
+        args_schema=Args,
+        coroutine=AsyncMock(),
+        response_format="content_and_artifact",
+    )
+
+    mock_session = AsyncMock()
+    mock_session.call_tool = AsyncMock(return_value=MagicMock(content=[], isError=False, structuredContent=None))
+    mock_cm = MagicMock()
+    mock_cm.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_cm.__aexit__ = AsyncMock(return_value=False)
+
+    async def secret_header_interceptor(request, handler):
+        from langgraph.config import get_config
+
+        secrets = (get_config().get("context") or {}).get("secrets") or {}
+        return await handler(request.override(headers={"Authorization": f"Bearer {secrets['MCP_AUTH_TOKEN']}"}))
+
+    with (
+        patch("langchain_mcp_adapters.sessions.create_session", return_value=mock_cm),
+        patch(
+            "langgraph.config.get_config",
+            return_value={"context": {"secrets": {"MCP_AUTH_TOKEN": "nested-secret"}}},
+        ),
+    ):
+        wrapped = _make_session_pool_tool(
+            original_tool,
+            "srv",
+            {"transport": "stdio", "command": "x", "args": []},
+            tool_interceptors=[secret_header_interceptor],
+        )
+        await wrapped.coroutine(runtime=None, x=1)
+
+    mock_session.call_tool.assert_awaited_once_with(
+        "act",
+        {"x": 1},
+        meta={"headers": {"Authorization": "Bearer nested-secret"}},
+    )
 
 
 @pytest.mark.asyncio
@@ -1677,7 +1768,7 @@ async def test_mcp_tools_routed_to_source_server_with_prefix_overlap():
 
     routed: list[tuple[str, str]] = []
 
-    def fake_wrap(tool, server_name, connection, interceptors, tool_call_timeout=None):
+    def fake_wrap(tool, server_name, connection, interceptors, tool_call_timeout=None, session_init_timeout=None, tool_name_prefix=True):
         routed.append((tool.name, server_name))
         return tool
 

@@ -20,6 +20,12 @@ https://github.com/user-attachments/assets/a8bcadc4-e040-4cf2-8fda-dd768b999c18
 
 想了解更多，或者直接看**真实演示**，可以访问[**官网**](https://deerflow.tech)。
 
+## 姐妹项目
+
+<img width="446" height="280" alt="image" align="middle" src="https://github.com/user-attachments/assets/077edef4-d560-41af-bb0d-d0a5f14fcc20" />
+
+- [**LLM Space**](https://github.com/deer-flow/llm-space) - 认识 DeerFlow 背后的秘密武器——一款桌面工具，用于原型化 agent 想法、检查 harness 的每个步骤、回放失败用例并基准测试性能。
+
 ## 字节跳动火山引擎方舟 Coding Plan
 
 - 我们推荐使用 Doubao-Seed-2.0-Code、DeepSeek v3.2 和 Kimi 2.5 运行 DeerFlow
@@ -190,6 +196,23 @@ DeerFlow 新近集成了 BytePlus 自研的智能搜索与抓取工具集——[
    - Codex CLI 会读取 `~/.codex/auth.json`
    - Claude Code 支持 `CLAUDE_CODE_OAUTH_TOKEN`、`ANTHROPIC_AUTH_TOKEN`、`CLAUDE_CODE_CREDENTIALS_PATH`，或 `~/.claude/.credentials.json`
    - ACP agent 条目与 model provider 是分开配置的——如果你配置了 `acp_agents.codex`，请把它指向一个 Codex ACP 适配器，例如 `npx -y @zed-industries/codex-acp`
+   - MiniMax Code 原生支持 ACP，不需要额外适配器。先安装并登录，再把它配置成 ACP agent：
+
+   ```bash
+   npm install --global @minimax-ai/code
+   mcode login
+   ```
+
+   ```yaml
+   acp_agents:
+     mcode:
+       command: mcode
+       args: ["acp"]
+       description: MiniMax Code for implementation, refactoring, debugging, and repository tasks
+       auto_approve_permissions: false
+   ```
+
+   `mcode` 必须位于 Gateway 进程的 `PATH` 中；只安装在 Docker host 上并不会让 Gateway 容器内可用。DeerFlow 会通过 `invoke_acp_agent` 在每个 thread 独立的 ACP workspace 中调用 MCode，并转发已启用的 MCP server。处理不可信任务时请保持 `auto_approve_permissions: false`；只有在任务可信且确实需要 MCode 修改文件或执行命令时才启用它。
    - 在 macOS 上，如有需要可显式导出 Claude Code 的认证信息：
 
    ```bash
@@ -421,6 +444,7 @@ DINGTALK_CLIENT_SECRET=your_client_secret
 
 1. 打开 [@BotFather](https://t.me/BotFather)，发送 `/newbot`，复制生成的 HTTP API token。
 2. 在 `.env` 中设置 `TELEGRAM_BOT_TOKEN`，并在 `config.yaml` 里启用该渠道。
+3. 机器人支持接收入站文本、图片和文档（可带说明文字，也可不带）；托管版 Bot API 的单个附件下载上限为 20 MB。
 
 **Slack 配置**
 
@@ -548,7 +572,7 @@ Tools 也是同样的思路。DeerFlow 自带一组核心工具：网页搜索�
 
 Gateway 生成后续建议时，现在会先把普通字符串输出和 block/list 风格的富文本内容统一归一化，再去解析 JSON 数组响应，因此不同 provider 的内容包装方式不会再悄悄把建议吞掉。
 
-Web UI 支持从已完成的 assistant 回复分叉出一个新的主对话。新 thread 会从该回复对应的 checkpoint 开始，并尽力复制当前 thread 的工作区文件。
+Web UI 支持从已完成的 assistant 回复分叉出一个新的主对话。新 thread 会保留该轮回复的 checkpoint 以及用户消息之前的重放 checkpoint，因此分叉后可以立即重新生成该回复。对于缺少 checkpoint 父链接的旧历史或导入历史，Gateway 会进行有界的时间顺序查找；如果不存在更早的重放 checkpoint，分叉仍会按旧版单-checkpoint 形态成功创建，但无法重新生成继承的回复。已有的单-checkpoint 分叉会保持不变，不会通过不安全的 checkpoint 复制尝试修复。只有从最新回合分叉时才会尽力复制当前 thread 的工作区文件；从历史回合分叉不会带入后续时间线创建的文件。
 
 ```text
 # sandbox 容器内的路径
@@ -616,11 +640,11 @@ Web UI 会在输入框上方展示当前激活的 goal。同样的命令在 TUI 
 
 ### Sub-Agents
 
-复杂任务通常不可能一次完成，DeerFlow 会先拆解，再执行。
+Sub-agent 是一种执行优化，而不是遇到复杂任务时的默认选择。
 
-lead agent 可以按需动态拉起 sub-agents。每个 sub-agent 都有自己独立的上下文、工具和终止条件。只要条件允许，它们就会并行运行，返回结构化结果，最后再由 lead agent 汇总成一份完整输出。
+lead agent 只会在委派具有明确净收益时动态拉起 sub-agents，例如真正缩短耗时的并行工作、专业能力收益或上下文隔离收益。存在跨 Agent 依赖或重叠副作用的工作不会并行分派；当专业能力或上下文隔离收益明显占优时，一条有界的顺序任务链仍可交给一个 sub-agent 完成。lead agent 会使用能取得收益的最少 sub-agents，并在每一批完成后重新评估，而不会仅仅因为任务规模大或步骤多就继续拆分。每个 sub-agent 都有自己独立的上下文、工具和终止条件，返回结构化结果后由 lead agent 验证并汇总成完整输出。
 
-这也是 DeerFlow 能处理从几分钟到几小时任务的原因。比如一个研究任务，可以拆成十几个 sub-agents，分别探索不同方向，最后合并成一份报告，或者一个网站，或者一套带生成视觉内容的演示文稿。一个 harness，多路并行。
+例如，彼此独立的只读研究可以在并行节省的时间明显高于重复检索和结果合并成本时并发执行；而会修改相同文件、依赖连续测试反馈的仓库重构则由 lead agent 直接完成。当 `max_concurrent_subagents` 为 `1` 时，提示词会关闭并行和多批次路由指导，仅在专业能力或上下文隔离具有明确收益时保留委派。
 
 ### Sandbox 与文件系统
 
@@ -649,6 +673,10 @@ DeerFlow 不只是“会说它能做”，它是真的有一台自己的“电�
 大多数 agents 会在对话结束后把一切都忘掉，DeerFlow 不一样。
 
 跨 session 使用时，DeerFlow 会逐步积累关于你的持久 memory，包括你的个人偏好、知识背景，以及长期沉淀下来的工作习惯。你用得越多，它越了解你的写作风格、技术栈和重复出现的工作流。memory 保存在本地，控制权也始终在你手里。
+
+默认 DeerMem `middleware` 模式会先判断候选信息的作用域、持久性和授权属性，再由确定性写入门决定是否保存。只有稳定、描述性的用户级事实能进入长期 memory；当前对话或项目的约束、一次性操作授权仍留在对话状态中。用户全局 summary 必须同时具有用户级作用域和描述性授权属性，基于矛盾的删除也会经过作用域保护；如果删除依赖一条替代事实，只有替代事实真正通过校验并保留下来后才执行删除。这些分类字段只用于本次抽取，不写入 fact 文件，也不增加 LLM 调用次数。`memory.mode: tool` 的显式 CRUD 仍是独立的模型直写路径。如果通过 `memory.backend_config.prompts_dir` 覆盖了内置抽取模板，必须同步在自定义模板中加入新的分类字段（`memory_update` 的 fact/summary/removal 格式与 `consolidation` 的合并 fact 结构）：写入门是 fail closed 的，未迁移的旧模板会导致所有抽取驱动的 fact、summary 与删除写入停止，只能通过 `rejected_by_scope_gate` 指标和高拒绝率告警发现。
+
+当一个作用域的 fact 达到 `max_facts` 时，DeerMem 默认仍沿用仅按 confidence 排序的旧策略。可以显式设置 `memory.backend_config.fact_eviction_policy: hybrid-v1`，改用有界综合分：confidence 65%、用户明确确认的新鲜度 25%、查询召回热度 10%。只有开启 hybrid-v1 或 shadow 模式时才会收集这两类信号元数据。确认由已有的 memory-update LLM 调用返回 `factsToReinforce`，但只有确定性消息检测也发现用户 reinforcement 信号时才会更新，并同时重置该 fact 的 staleness review 时钟。这个确定性门禁是批次级的：它只能证明当前抽取批次最后六条已过滤消息中的某条用户消息命中了 reinforcement 模式。具体 fact 由 LLM 选择的 `factsToReinforce` ID 绑定；DeerMem 不会另外校验该信号与 fact 的一一对应关系。重复抽取、自动注入和单纯召回都不会确认 fact。自定义 `memory_update` prompt 如果希望参与确认新鲜度，需要加入可选的 `factsToReinforce` 数组。召回热度单独保存在衰减 sidecar 中，只有 `memory_search` 真正返回的 fact 才增加，不会重写 canonical Markdown 或污染 `updatedAt`。Hybrid 模式还为 correction 保留有限的最低槽位（容量的 10%，最多 10 个；未使用的槽位会释放给其他类别）。容量删除仍是物理删除，但会留下不含正文的有界审计记录。启用 `fact_eviction_shadow_enabled` 可以在不改变实际保留结果的情况下比较 hybrid-v1；整个功能不增加 LLM 调用，切回 `confidence` 即可回滚。
 
 ## 推荐模型
 
@@ -786,4 +814,4 @@ DeerFlow 建立在开源社区大量优秀工作的基础上。所有让 DeerFlo
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=bytedance/deer-flow&type=Date)](https://star-history.com/#bytedance/deer-flow&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=bytedance/deer-flow&type=Date)](https://star-history.dera.page/#bytedance/deer-flow&Date)

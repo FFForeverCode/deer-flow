@@ -17,14 +17,13 @@ Usage:
 
 import asyncio
 import concurrent.futures
-import json
+import copy
 import logging
 import mimetypes
 import os
 import shutil
-import tempfile
 import uuid
-from collections.abc import Generator, Sequence
+from collections.abc import Generator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -34,14 +33,30 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 
-from deerflow.agents.lead_agent.agent import build_middlewares
+from deerflow.agents.lead_agent.agent import _authorize_model_name, build_middlewares
 from deerflow.agents.lead_agent.prompt import apply_prompt_template, get_enabled_skills_for_config
-from deerflow.agents.thread_state import ThreadState
+from deerflow.agents.thread_state import get_thread_state_schema, normalize_middleware_state_schemas
+from deerflow.authz.principal import build_principal_from_context
 from deerflow.config.agents_config import AGENT_NAME_PATTERN
 from deerflow.config.app_config import get_app_config, is_trace_correlation_enabled, reload_app_config
-from deerflow.config.extensions_config import ExtensionsConfig, SkillStateConfig, get_extensions_config, reload_extensions_config
+from deerflow.config.extensions_config import (
+    ExtensionsConfig,
+    SkillStateConfig,
+    atomic_write_extensions_config,
+    extensions_config_file_lock,
+    extensions_config_write_lock,
+    get_extensions_config,
+    reload_extensions_config,
+)
 from deerflow.config.paths import get_paths
 from deerflow.models import create_chat_model
+from deerflow.runtime import CheckpointStateAccessor
+from deerflow.runtime.checkpoint_mode import (
+    ensure_checkpoint_mode_compatible,
+    freeze_checkpoint_channel_mode,
+    freeze_checkpoint_snapshot_frequency,
+    inject_checkpoint_mode,
+)
 from deerflow.runtime.goal import DEFAULT_MAX_GOAL_CONTINUATIONS, build_goal_state, goal_thread_lock, read_thread_goal, write_thread_goal
 from deerflow.runtime.user_context import get_effective_user_id
 from deerflow.skills.describe import build_skill_search_setup
@@ -59,8 +74,21 @@ from deerflow.uploads.manager import (
     upload_artifact_url,
     upload_virtual_path,
 )
+from deerflow.utils.thread_id import resolve_thread_id, validate_thread_id
 
 logger = logging.getLogger(__name__)
+
+_EMBEDDED_AUTHORIZATION_CONTEXT_KEYS = frozenset(
+    {
+        "user_id",
+        "user_role",
+        "oauth_provider",
+        "oauth_id",
+        "channel_user_id",
+        "is_internal",
+        "authz_attributes",
+    }
+)
 
 
 def _run_async_from_sync(coro):
@@ -171,6 +199,8 @@ class DeerFlowClient:
         if config_path is not None:
             reload_app_config(config_path)
         self._app_config = get_app_config()
+        self._checkpoint_channel_mode = freeze_checkpoint_channel_mode(self._app_config.database.checkpoint_channel_mode)
+        self._checkpoint_snapshot_frequency = freeze_checkpoint_snapshot_frequency(self._app_config.database.checkpoint_delta.snapshot_frequency)
 
         if agent_name is not None and not AGENT_NAME_PATTERN.match(agent_name):
             raise ValueError(f"Invalid agent name '{agent_name}'. Must match pattern: {AGENT_NAME_PATTERN.pattern}")
@@ -206,20 +236,7 @@ class DeerFlowClient:
     @staticmethod
     def _atomic_write_json(path: Path, data: dict) -> None:
         """Write JSON to *path* atomically (temp file + replace)."""
-        fd = tempfile.NamedTemporaryFile(
-            mode="w",
-            dir=path.parent,
-            suffix=".tmp",
-            delete=False,
-        )
-        try:
-            json.dump(data, fd, indent=2)
-            fd.close()
-            Path(fd.name).replace(path)
-        except BaseException:
-            fd.close()
-            Path(fd.name).unlink(missing_ok=True)
-            raise
+        atomic_write_extensions_config(path, data)
 
     def _get_runnable_config(self, thread_id: str, **overrides) -> RunnableConfig:
         """Build a RunnableConfig for agent invocation."""
@@ -235,9 +252,27 @@ class DeerFlowClient:
             recursion_limit=overrides.get("recursion_limit", 100),
         )
 
-    def _ensure_agent(self, config: RunnableConfig):
+    def _ensure_agent(self, config: RunnableConfig, *, context: Mapping[str, Any] | None = None):
         """Create (or recreate) the agent when config-dependent params change."""
-        cfg = config.get("configurable", {})
+        cfg = dict(config.get("configurable", {}) or {})
+        if context is not None:
+            cfg.update(context)
+
+        authorization_identity = None
+        if self._app_config.authorization.enabled:
+            principal = build_principal_from_context(
+                cfg,
+                default_role=self._app_config.authorization.default_role,
+            )
+            authorization_identity = (
+                principal.user_id,
+                principal.role,
+                principal.oauth_provider,
+                principal.oauth_id,
+                principal.channel_user_id,
+                principal.is_internal,
+                copy.deepcopy(principal.attributes),
+            )
         key = (
             cfg.get("model_name"),
             cfg.get("thinking_enabled"),
@@ -247,6 +282,9 @@ class DeerFlowClient:
             cfg.get("max_total_subagents"),
             self._agent_name,
             frozenset(self._available_skills) if self._available_skills is not None else None,
+            self._checkpoint_channel_mode,
+            self._checkpoint_snapshot_frequency,
+            authorization_identity,
         )
 
         if self._agent is not None and self._agent_config_key == key:
@@ -254,20 +292,24 @@ class DeerFlowClient:
 
         thinking_enabled = cfg.get("thinking_enabled", True)
         model_name = cfg.get("model_name")
+        # Phase 3: enforce model:use authorization on the embedded/library path
+        # too, mirroring the Gateway runtime path in ``_make_lead_agent`` so the
+        # role-scoped model policy cannot be bypassed by constructing the agent
+        # through ``DeerFlowClient``. Resolve the ``None`` default to a concrete
+        # name first (what ``create_chat_model(name=None)`` would pick) so the
+        # policy covers the implicit default model. ``cfg`` already carries the
+        # identity that ``apply_tool_authorization`` reads below.
+        if model_name is None and self._app_config.models:
+            model_name = self._app_config.models[0].name
+        model_name = _authorize_model_name(model_name, context=cfg, app_config=self._app_config)
         subagent_enabled = cfg.get("subagent_enabled", False)
         max_concurrent_subagents = cfg.get("max_concurrent_subagents", 3)
         max_total_subagents = cfg.get("max_total_subagents", self._app_config.subagents.max_total_per_run)
 
         tools = self._get_tools(model_name=model_name, subagent_enabled=subagent_enabled)
-        final_tools, deferred_setup = assemble_deferred_tools(tools, enabled=self._app_config.tool_search.enabled)
-        mcp_routing_middleware = build_mcp_routing_middleware(
-            final_tools,
-            deferred_setup,
-            top_k=self._app_config.tool_search.auto_promote_top_k,
-        )
-        mcp_routing_hints_section = get_mcp_routing_hints_prompt_section(tools, deferred_names=deferred_setup.deferred_names)
 
-        # Wire deferred skill discovery — mirrors agent.py so config flag works on both paths.
+        # Add framework-provided tools before authorization so Layer 1 sees
+        # every capability that can become model-visible.
         skills_list = get_enabled_skills_for_config(self._app_config)
         if self._available_skills is not None:
             skills_list = [s for s in skills_list if s.name in self._available_skills]
@@ -276,8 +318,31 @@ class DeerFlowClient:
             enabled=self._app_config.skills.deferred_discovery,
             container_base_path=self._app_config.skills.container_path,
         )
+        late_tools = []
         if skill_setup.describe_skill_tool:
-            final_tools.append(skill_setup.describe_skill_tool)
+            late_tools.append(skill_setup.describe_skill_tool)
+
+        # Apply authorization Layer 1 before deferred assembly.
+        from deerflow.authz.tool_filter import apply_tool_authorization
+
+        configured_tool_ids = {id(tool) for tool in tools}
+        authorized_tools, _authz_provider = apply_tool_authorization(
+            [*tools, *late_tools],
+            context=cfg,
+            app_config=self._app_config,
+        )
+        tools = [tool for tool in authorized_tools if id(tool) in configured_tool_ids]
+        late_tools = [tool for tool in authorized_tools if id(tool) not in configured_tool_ids]
+        final_tools, deferred_setup = assemble_deferred_tools(tools, enabled=self._app_config.tool_search.enabled)
+        final_tools.extend(late_tools)
+        mcp_routing_middleware = build_mcp_routing_middleware(
+            final_tools,
+            deferred_setup,
+            top_k=self._app_config.tool_search.auto_promote_top_k,
+        )
+        mcp_routing_hints_section = get_mcp_routing_hints_prompt_section(authorized_tools, deferred_names=deferred_setup.deferred_names)
+
+        effective_user_id = cfg.get("user_id") or get_effective_user_id()
 
         kwargs: dict[str, Any] = {
             # attach_tracing=False because ``stream()`` injects tracing
@@ -286,16 +351,21 @@ class DeerFlowClient:
             # Attaching them again on the model would emit duplicate spans.
             "model": create_chat_model(name=model_name, thinking_enabled=thinking_enabled, attach_tracing=False),
             "tools": final_tools,
-            "middleware": build_middlewares(
-                config,
-                model_name=model_name,
-                agent_name=self._agent_name,
-                available_skills=self._available_skills,
-                custom_middlewares=self._middlewares,
-                app_config=self._app_config,
-                deferred_setup=deferred_setup,
-                mcp_routing_middleware=mcp_routing_middleware,
-                user_id=get_effective_user_id(),
+            "middleware": normalize_middleware_state_schemas(
+                build_middlewares(
+                    config,
+                    model_name=model_name,
+                    agent_name=self._agent_name,
+                    available_skills=self._available_skills,
+                    custom_middlewares=self._middlewares,
+                    app_config=self._app_config,
+                    deferred_setup=deferred_setup,
+                    mcp_routing_middleware=mcp_routing_middleware,
+                    user_id=effective_user_id,
+                    authorization_provider=_authz_provider,
+                ),
+                self._checkpoint_channel_mode,
+                self._checkpoint_snapshot_frequency,
             ),
             "system_prompt": apply_prompt_template(
                 subagent_enabled=subagent_enabled,
@@ -306,10 +376,10 @@ class DeerFlowClient:
                 app_config=self._app_config,
                 deferred_names=deferred_setup.deferred_names,
                 mcp_routing_hints_section=mcp_routing_hints_section,
-                user_id=get_effective_user_id(),
+                user_id=effective_user_id,
                 skill_names=skill_setup.skill_names or None,
             ),
-            "state_schema": ThreadState,
+            "state_schema": get_thread_state_schema(self._checkpoint_channel_mode, self._checkpoint_snapshot_frequency),
         }
         checkpointer = self._checkpointer
         if checkpointer is None:
@@ -369,16 +439,16 @@ class DeerFlowClient:
     @staticmethod
     def _tool_message_event(msg: ToolMessage) -> "StreamEvent":
         """Build a ``messages-tuple`` tool-result event from a ToolMessage."""
-        return StreamEvent(
-            type="messages-tuple",
-            data={
-                "type": "tool",
-                "content": DeerFlowClient._extract_text(msg.content),
-                "name": msg.name,
-                "tool_call_id": msg.tool_call_id,
-                "id": msg.id,
-            },
-        )
+        data: dict[str, Any] = {
+            "type": "tool",
+            "content": DeerFlowClient._extract_text(msg.content),
+            "name": msg.name,
+            "tool_call_id": msg.tool_call_id,
+            "id": msg.id,
+        }
+        if (artifact := getattr(msg, "artifact", None)) is not None:
+            data["artifact"] = artifact
+        return StreamEvent(type="messages-tuple", data=data)
 
     @staticmethod
     def _serialize_message(msg) -> dict:
@@ -402,6 +472,8 @@ class DeerFlowClient:
             }
             if additional_kwargs := DeerFlowClient._serialize_additional_kwargs(msg):
                 d["additional_kwargs"] = additional_kwargs
+            if (artifact := getattr(msg, "artifact", None)) is not None:
+                d["artifact"] = artifact
             return d
         if isinstance(msg, HumanMessage):
             d = {"type": "human", "content": msg.content, "id": getattr(msg, "id", None)}
@@ -466,6 +538,7 @@ class DeerFlowClient:
 
     def get_goal(self, thread_id: str) -> dict:
         """Return the active goal for a thread, if any."""
+        validate_thread_id(thread_id)
         checkpointer = self._get_thread_checkpointer()
         goal = _run_async_from_sync(read_thread_goal(checkpointer, thread_id))
         return {"goal": goal}
@@ -478,6 +551,7 @@ class DeerFlowClient:
         max_continuations: int = DEFAULT_MAX_GOAL_CONTINUATIONS,
     ) -> dict:
         """Set or replace a thread-scoped goal."""
+        validate_thread_id(thread_id)
         checkpointer = self._get_thread_checkpointer()
         goal = build_goal_state(objective, max_continuations=max_continuations)
 
@@ -490,6 +564,7 @@ class DeerFlowClient:
 
     def clear_goal(self, thread_id: str) -> dict:
         """Clear the active goal for a thread."""
+        validate_thread_id(thread_id)
         checkpointer = self._get_thread_checkpointer()
 
         async def _clear_goal() -> None:
@@ -555,41 +630,50 @@ class DeerFlowClient:
         return {"thread_list": threads[:limit]}
 
     def get_thread(self, thread_id: str) -> dict:
-        """Get the complete thread record, including all node execution records.
-
-        Args:
-            thread_id: Thread ID.
-
-        Returns:
-            Dict containing the thread's full checkpoint history.
-        """
+        """Get the complete materialized checkpoint history for a thread."""
         checkpointer = self._get_thread_checkpointer()
+        config = self._get_runnable_config(thread_id)
+        self._ensure_agent(config)
+        if self._agent is None:
+            raise RuntimeError("Agent was not initialized")
 
-        config = {"configurable": {"thread_id": thread_id}}
+        accessor = CheckpointStateAccessor.bind(
+            self._agent,
+            checkpointer,
+            mode=self._checkpoint_channel_mode,
+        )
+        # One streaming walk collects pending_writes per checkpoint id; a
+        # per-snapshot get_tuple would cost one round-trip per checkpoint.
+        pending_writes_by_checkpoint: dict[str, list] = {}
+        for raw_tuple in checkpointer.list(config):
+            raw_checkpoint_id = raw_tuple.config.get("configurable", {}).get("checkpoint_id")
+            if raw_checkpoint_id:
+                pending_writes_by_checkpoint[raw_checkpoint_id] = list(getattr(raw_tuple, "pending_writes", ()) or ())
+
         checkpoints = []
+        for snapshot in accessor.history(config):
+            values = dict(snapshot.values or {})
+            if "messages" in values:
+                values["messages"] = [self._serialize_message(message) if hasattr(message, "content") else message for message in values["messages"]]
 
-        for cp in checkpointer.list(config):
-            channel_values = dict(cp.checkpoint.get("channel_values", {}))
-            if "messages" in channel_values:
-                channel_values["messages"] = [self._serialize_message(m) if hasattr(m, "content") else m for m in channel_values["messages"]]
-
-            cfg = cp.config.get("configurable", {})
-            parent_cfg = cp.parent_config.get("configurable", {}) if cp.parent_config else {}
+            snapshot_config = snapshot.config or {}
+            configurable = snapshot_config.get("configurable", {})
+            parent_config = snapshot.parent_config or {}
+            parent_configurable = parent_config.get("configurable", {})
+            pending_writes = pending_writes_by_checkpoint.get(configurable.get("checkpoint_id"), [])
 
             checkpoints.append(
                 {
-                    "checkpoint_id": cfg.get("checkpoint_id"),
-                    "parent_checkpoint_id": parent_cfg.get("checkpoint_id"),
-                    "ts": cp.checkpoint.get("ts"),
-                    "metadata": cp.metadata,
-                    "values": channel_values,
-                    "pending_writes": [{"task_id": w[0], "channel": w[1], "value": w[2]} for w in getattr(cp, "pending_writes", [])],
+                    "checkpoint_id": configurable.get("checkpoint_id"),
+                    "parent_checkpoint_id": parent_configurable.get("checkpoint_id"),
+                    "ts": snapshot.created_at,
+                    "metadata": snapshot.metadata,
+                    "values": values,
+                    "pending_writes": [{"task_id": write[0], "channel": write[1], "value": write[2]} for write in pending_writes],
                 }
             )
 
-        # Sort globally by timestamp to prevent partial ordering issues caused by different namespaces (e.g., subgraphs)
-        checkpoints.sort(key=lambda x: x["ts"] if x["ts"] else "")
-
+        checkpoints.sort(key=lambda checkpoint: checkpoint["ts"] or "")
         return {"thread_id": thread_id, "checkpoints": checkpoints}
 
     # ------------------------------------------------------------------
@@ -719,7 +803,9 @@ class DeerFlowClient:
             message: User message text.
             thread_id: Thread ID for conversation context. Auto-generated if None.
             **kwargs: Override client defaults (model_name, thinking_enabled,
-                plan_mode, subagent_enabled, recursion_limit).
+                plan_mode, subagent_enabled, recursion_limit). Trusted embedded
+                callers may also provide user_id, user_role, oauth_provider,
+                oauth_id, channel_user_id, is_internal, and authz_attributes.
 
         Yields:
             StreamEvent with one of:
@@ -730,12 +816,30 @@ class DeerFlowClient:
             - type="messages-tuple"  data={"type": "ai", "content": "", "id": str, "tool_calls": [...]}
             - type="messages-tuple"  data={"type": "ai", "content": "", "id": str, "additional_kwargs": {...}}
             - type="messages-tuple"  data={"type": "tool", "content": str, "name": str, "tool_call_id": str, "id": str}
+              Tool results also include ``"artifact"`` when the source ToolMessage has a non-None artifact.
             - type="end"             data={"usage": {"input_tokens": int, "output_tokens": int, "total_tokens": int}}
         """
-        if thread_id is None:
-            thread_id = str(uuid.uuid4())
+        thread_id = resolve_thread_id(thread_id)
 
         config = self._get_runnable_config(thread_id, **kwargs)
+        inject_checkpoint_mode(config, self._checkpoint_channel_mode)
+        checkpoint_config = {
+            "configurable": {
+                "thread_id": thread_id,
+                "checkpoint_ns": "",
+            }
+        }
+        checkpointer = self._checkpointer
+        if checkpointer is None:
+            from deerflow.runtime.checkpointer import get_checkpointer
+
+            checkpointer = get_checkpointer()
+        if checkpointer is not None:
+            ensure_checkpoint_mode_compatible(
+                checkpointer,
+                checkpoint_config,
+                self._checkpoint_channel_mode,
+            )
 
         # Inject tracing callbacks and Langfuse trace metadata at the graph
         # invocation root so the embedded client matches the gateway worker's
@@ -748,23 +852,34 @@ class DeerFlowClient:
             existing_callbacks = list(config.get("callbacks") or [])
             config["callbacks"] = [*existing_callbacks, *tracing_callbacks]
 
+        run_id = str(uuid.uuid4())
+        context: dict[str, Any] = {"thread_id": thread_id, "run_id": run_id}
+        for key in _EMBEDDED_AUTHORIZATION_CONTEXT_KEYS:
+            if key in kwargs:
+                context[key] = kwargs[key]
+
         configurable = config.get("configurable") or {}
         deerflow_trace_id = get_current_trace_id()
+        effective_user_id = context.get("user_id") or get_effective_user_id()
+        if self._app_config.authorization.enabled:
+            # Match the existing user-scoped storage/tracing identity when an
+            # embedded caller relies on CurrentUser instead of an explicit
+            # user_id override. Layer 1, Layer 2, and the agent cache must see
+            # the same actor.
+            context["user_id"] = effective_user_id
         inject_langfuse_metadata(
             config,
             thread_id=thread_id,
-            user_id=get_effective_user_id(),
+            user_id=effective_user_id,
             assistant_id=self._agent_name or "lead-agent",
             model_name=configurable.get("model_name") or self._model_name,
             environment=self._environment or os.environ.get("DEER_FLOW_ENV") or os.environ.get("ENVIRONMENT"),
             deerflow_trace_id=deerflow_trace_id,
         )
 
-        self._ensure_agent(config)
+        self._ensure_agent(config, context=context)
 
-        run_id = str(uuid.uuid4())
         state: dict[str, Any] = {"messages": [HumanMessage(content=message, additional_kwargs={"run_id": run_id})]}
-        context = {"thread_id": thread_id, "run_id": run_id}
         if deerflow_trace_id:
             context[DEERFLOW_TRACE_METADATA_KEY] = deerflow_trace_id
         if self._agent_name:
@@ -1115,18 +1230,18 @@ class DeerFlowClient:
         if config_path is None:
             raise FileNotFoundError("Cannot locate extensions_config.json. Set DEER_FLOW_EXTENSIONS_CONFIG_PATH or ensure it exists in the project root.")
 
-        current_config = get_extensions_config()
+        with extensions_config_write_lock, extensions_config_file_lock(config_path):
+            # The singleton is process-local, so re-read the shared file under
+            # the cross-process lock before merging the replacement MCP map.
+            current_config = ExtensionsConfig.from_file(config_path)
+            config_data = current_config.to_file_dict()
+            config_data["mcpServers"] = mcp_servers
 
-        config_data = {
-            "mcpServers": mcp_servers,
-            "skills": {name: {"enabled": skill.enabled} for name, skill in current_config.skills.items()},
-        }
-
-        self._atomic_write_json(config_path, config_data)
+            self._atomic_write_json(config_path, config_data)
+            reloaded = reload_extensions_config()
 
         self._agent = None
         self._agent_config_key = None
-        reloaded = reload_extensions_config()
         return {"mcp_servers": {name: server.model_dump() for name, server in reloaded.mcp_servers.items()}}
 
     # ------------------------------------------------------------------
@@ -1183,16 +1298,20 @@ class DeerFlowClient:
             if config_path is None:
                 raise FileNotFoundError("Cannot locate extensions_config.json. Set DEER_FLOW_EXTENSIONS_CONFIG_PATH or ensure it exists in the project root.")
 
-            extensions_config = get_extensions_config()
-            extensions_config.skills[name] = SkillStateConfig(enabled=enabled)
+            from deerflow.skills.projection import skill_projection_mutation
 
-            config_data = {
-                "mcpServers": {n: s.model_dump() for n, s in extensions_config.mcp_servers.items()},
-                "skills": {n: {"enabled": sc.enabled} for n, sc in extensions_config.skills.items()},
-            }
+            removal_names = (name,) if not enabled else ()
+            with skill_projection_mutation(storage, "public", remove_names=removal_names):
+                with extensions_config_write_lock, extensions_config_file_lock(config_path):
+                    # The projection lock is cross-process, but the singleton
+                    # cache is not. Reload from disk under the config lock.
+                    extensions_config = ExtensionsConfig.from_file(config_path)
+                    extensions_config.skills[name] = SkillStateConfig(enabled=enabled)
 
-            self._atomic_write_json(config_path, config_data)
-            reload_extensions_config()
+                    config_data = extensions_config.to_file_dict()
+
+                    self._atomic_write_json(config_path, config_data)
+                    reload_extensions_config()
         else:
             # CUSTOM / LEGACY: write per-user state
             from deerflow.skills.storage.user_scoped_skill_storage import UserScopedSkillStorage
@@ -1204,14 +1323,12 @@ class DeerFlowClient:
                 config_path = ExtensionsConfig.resolve_config_path()
                 if config_path is None:
                     raise FileNotFoundError("Cannot locate extensions_config.json. Set DEER_FLOW_EXTENSIONS_CONFIG_PATH or ensure it exists in the project root.")
-                extensions_config = get_extensions_config()
-                extensions_config.skills[name] = SkillStateConfig(enabled=enabled)
-                config_data = {
-                    "mcpServers": {n: s.model_dump() for n, s in extensions_config.mcp_servers.items()},
-                    "skills": {n: {"enabled": sc.enabled} for n, sc in extensions_config.skills.items()},
-                }
-                self._atomic_write_json(config_path, config_data)
-                reload_extensions_config()
+                with extensions_config_write_lock, extensions_config_file_lock(config_path):
+                    extensions_config = ExtensionsConfig.from_file(config_path)
+                    extensions_config.skills[name] = SkillStateConfig(enabled=enabled)
+                    config_data = extensions_config.to_file_dict()
+                    self._atomic_write_json(config_path, config_data)
+                    reload_extensions_config()
 
         # Invalidate the prompt cache for this caller (and for all users if
         # the changed skill is PUBLIC, since PUBLIC state is shared). Mirrors
@@ -1272,14 +1389,24 @@ class DeerFlowClient:
 
         Returns:
             The reloaded memory data dict.
+
+        Backends without a reload concept (e.g. noop) fall back to
+        ``get_memory``; a backend that exposes neither (a minimal ``add`` +
+        ``get_context`` backend) raises ``NotImplementedError`` so the caller
+        sees a clean unsupported-op error instead of an uncaught propagation.
         """
         from deerflow.agents.memory import get_memory_manager
 
         manager = get_memory_manager()
-        if hasattr(manager, "reload_memory"):
-            return manager.reload_memory(user_id=get_effective_user_id())
-        # Non-DeerMem backends have no reload concept; return current memory.
-        return manager.get_memory(user_id=get_effective_user_id())
+        user_id = get_effective_user_id()
+        try:
+            return manager.reload_memory(user_id=user_id)
+        except NotImplementedError:
+            pass  # no reload concept; fall back to current memory below
+        try:
+            return manager.get_memory(user_id=user_id)
+        except NotImplementedError:
+            raise NotImplementedError(f"reload_memory not supported by memory backend {type(manager).__name__}: implements neither reload_memory nor get_memory") from None
 
     def clear_memory(self) -> dict:
         """Clear all persisted memory data."""
@@ -1292,11 +1419,9 @@ class DeerFlowClient:
         from deerflow.agents.memory import get_memory_manager
 
         manager = get_memory_manager()
-        if not hasattr(manager, "create_fact"):
-            raise NotImplementedError(f"create_fact not supported by memory backend '{type(manager).__name__}'")
         memory_data, fact_id = manager.create_fact(content=content, category=category, confidence=confidence, user_id=get_effective_user_id())
         if fact_id is None:
-            raise ValueError("Fact was not stored because memory.max_facts kept higher-confidence facts")
+            raise ValueError("Fact was not stored because the configured memory.max_facts capacity policy evicted it")
         return memory_data
 
     def delete_memory_fact(self, fact_id: str) -> dict:
@@ -1304,8 +1429,6 @@ class DeerFlowClient:
         from deerflow.agents.memory import get_memory_manager
 
         manager = get_memory_manager()
-        if not hasattr(manager, "delete_fact"):
-            raise NotImplementedError(f"delete_fact not supported by memory backend '{type(manager).__name__}'")
         return manager.delete_fact(fact_id, user_id=get_effective_user_id())
 
     def update_memory_fact(
@@ -1319,8 +1442,6 @@ class DeerFlowClient:
         from deerflow.agents.memory import get_memory_manager
 
         manager = get_memory_manager()
-        if not hasattr(manager, "update_fact"):
-            raise NotImplementedError(f"update_fact not supported by memory backend '{type(manager).__name__}'")
         return manager.update_fact(
             fact_id=fact_id,
             content=content,
@@ -1379,6 +1500,7 @@ class DeerFlowClient:
             FileNotFoundError: If any file does not exist.
             ValueError: If any supplied path exists but is not a regular file.
         """
+        validate_thread_id(thread_id)
         from deerflow.utils.file_conversion import CONVERTIBLE_EXTENSIONS, convert_file_to_markdown
 
         # Validate all files upfront to avoid partial uploads.
@@ -1482,6 +1604,7 @@ class DeerFlowClient:
             Dict with "files" and "count" keys, matching the Gateway API
             ``list_uploaded_files`` response.
         """
+        validate_thread_id(thread_id)
         uploads_dir = get_uploads_dir(thread_id)
         result = list_files_in_dir(uploads_dir)
         return enrich_file_listing(result, thread_id)
@@ -1501,6 +1624,7 @@ class DeerFlowClient:
             FileNotFoundError: If the file does not exist.
             PermissionError: If path traversal is detected.
         """
+        validate_thread_id(thread_id)
         from deerflow.utils.file_conversion import CONVERTIBLE_EXTENSIONS
 
         uploads_dir = get_uploads_dir(thread_id)
@@ -1524,6 +1648,7 @@ class DeerFlowClient:
             FileNotFoundError: If the artifact does not exist.
             ValueError: If the path is invalid.
         """
+        validate_thread_id(thread_id)
         try:
             actual = get_paths().resolve_virtual_path(thread_id, path, user_id=get_effective_user_id())
         except ValueError as exc:
